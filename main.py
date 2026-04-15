@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitMergeMods v1.1
+GitMergeMods v1.11
 Легковесное приложение для синхронизации файлов модов с GitHub.
 Работает через GitHub REST API — не требует установки Git.
 Batch-коммиты, мерж по умолчанию, конфликт-диалог.
@@ -15,6 +15,7 @@ import hashlib
 import base64
 import shutil
 import threading
+import ssl
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from urllib.request import Request, urlopen
@@ -25,12 +26,22 @@ import difflib
 import re
 from dulwich import porcelain
 
+try:
+    import truststore
+except ImportError:
+    truststore = None
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
+
 # ============================================================
 # Константы
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.10"
+APP_VERSION = "1.11"
 SCAN_INTERVAL_SEC = 5
 AUTO_CONNECT_RETRY_SEC = 10
 API_BASE = "https://api.github.com"
@@ -59,6 +70,66 @@ def log_error(msg):
             f.write(line)
     except Exception:
         pass
+
+
+_SSL_CONTEXT = None
+_SSL_CA_SOURCE = "default"
+_SSL_CA_FILE = None
+
+
+def get_ssl_context():
+    """Возвращает SSL context с доверенными сертификатами.
+
+    Приоритет:
+    1. truststore — системное хранилище сертификатов Windows
+    2. certifi — встроенный CA bundle внутри exe
+    3. стандартный ssl context Python
+    """
+    global _SSL_CONTEXT, _SSL_CA_SOURCE, _SSL_CA_FILE
+
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+
+    if truststore is not None:
+        try:
+            truststore.inject_into_ssl()
+            _SSL_CA_SOURCE = "truststore"
+            _SSL_CONTEXT = ssl.create_default_context()
+            return _SSL_CONTEXT
+        except Exception as e:
+            log_error(f"ssl truststore init: {e}")
+
+    if certifi is not None:
+        try:
+            ca_file = certifi.where()
+            if ca_file and os.path.isfile(ca_file):
+                os.environ.setdefault("SSL_CERT_FILE", ca_file)
+                os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_file)
+                os.environ.setdefault("CURL_CA_BUNDLE", ca_file)
+                _SSL_CA_SOURCE = "certifi"
+                _SSL_CA_FILE = ca_file
+                _SSL_CONTEXT = ssl.create_default_context(cafile=ca_file)
+                return _SSL_CONTEXT
+        except Exception as e:
+            log_error(f"ssl certifi init: {e}")
+
+    _SSL_CA_SOURCE = "default"
+    _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
+
+
+def get_urllib3_pool_manager():
+    """Создаёт urllib3 PoolManager с правильным SSL context для dulwich."""
+    try:
+        import urllib3
+        return urllib3.PoolManager(ssl_context=get_ssl_context(), timeout=60)
+    except Exception as e:
+        log_error(f"urllib3 pool init: {e}")
+        return None
+
+
+# Инициализируем SSL до первых сетевых запросов.
+get_ssl_context()
 
 
 # ============================================================
@@ -405,7 +476,7 @@ class GitHubClient:
             req.add_header("Content-Type", "application/json")
 
         try:
-            with urlopen(req, timeout=30) as resp:
+            with urlopen(req, timeout=30, context=get_ssl_context()) as resp:
                 if resp.status in (200, 201):
                     raw = resp.read()
                     return json.loads(raw.decode("utf-8")) if raw else None
@@ -418,7 +489,18 @@ class GitHubClient:
             error_body = e.read().decode("utf-8", errors="replace")
             raise Exception(f"GitHub API ошибка {e.code}: {error_body[:300]}")
         except URLError as e:
-            raise Exception(f"Сетевая ошибка: {e.reason}")
+            reason = getattr(e, "reason", e)
+            reason_text = str(reason)
+            if (isinstance(reason, ssl.SSLCertVerificationError)
+                    or "CERTIFICATE_VERIFY_FAILED" in reason_text):
+                details = "Сетевая ошибка SSL: не удалось проверить сертификат GitHub. "
+                details += "Проверьте HTTPS-перехват антивирусом/прокси и корневые сертификаты Windows."
+                if _SSL_CA_SOURCE == "certifi":
+                    details += " Приложение использует встроенный CA bundle certifi."
+                elif _SSL_CA_SOURCE == "truststore":
+                    details += " Приложение использует системное хранилище сертификатов Windows."
+                raise Exception(details)
+            raise Exception(f"Сетевая ошибка: {reason}")
         except Exception as e:
             raise Exception(f"Ошибка запроса: {e}")
 
@@ -1471,15 +1553,18 @@ class MainApp(tk.Tk):
         def fresh_clone():
             if os.path.exists(repo_path):
                 shutil.rmtree(repo_path, ignore_errors=True)
-            report("Клонирование transport-репозитория...", 3)
-            porcelain.clone(
-                auth_url,
-                target=repo_path,
+            report("Клонирование transport-репозитория (shallow)...", 3)
+            pool = get_urllib3_pool_manager()
+            clone_kwargs = dict(
                 checkout=True,
                 branch=self.config.branch,
+                depth=1,
                 outstream=io.BytesIO(),
                 errstream=io.BytesIO(),
             )
+            if pool is not None:
+                clone_kwargs["pool_manager"] = pool
+            porcelain.clone(auth_url, target=repo_path, **clone_kwargs)
 
         git_dir = os.path.join(repo_path, ".git")
         if not os.path.isdir(git_dir):
@@ -1494,17 +1579,20 @@ class MainApp(tk.Tk):
                 return repo_path
 
             report("Обновление transport-репозитория...", 5)
-            porcelain.pull(
-                repo_path,
+            pool = get_urllib3_pool_manager()
+            pull_kwargs = dict(
                 remote_location=auth_url,
                 outstream=io.BytesIO(),
                 errstream=io.BytesIO(),
                 fast_forward=True,
                 force=True,
             )
+            if pool is not None:
+                pull_kwargs["pool_manager"] = pool
+            porcelain.pull(repo_path, **pull_kwargs)
             return repo_path
         except Exception as e:
-            log_error(f"transport ensure: {e}")
+            log_error(f"transport pull failed, re-cloning: {e}")
             fresh_clone()
             return repo_path
 
@@ -1547,13 +1635,16 @@ class MainApp(tk.Tk):
         commit_id = porcelain.commit(repo_path, message=message)
 
         report("Отправка pack в GitHub...", 85)
-        result = porcelain.push(
-            repo_path,
+        pool = get_urllib3_pool_manager()
+        push_kwargs = dict(
             remote_location=auth_url,
             refspecs=f"refs/heads/{self.config.branch}:refs/heads/{self.config.branch}",
             outstream=io.BytesIO(),
             errstream=io.BytesIO(),
         )
+        if pool is not None:
+            push_kwargs["pool_manager"] = pool
+        result = porcelain.push(repo_path, **push_kwargs)
 
         ref_status = getattr(result, "ref_status", None) or {}
         failures = {k: v for k, v in ref_status.items() if v}

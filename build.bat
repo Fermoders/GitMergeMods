@@ -13,30 +13,53 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Проверяем pip
+python -m pip --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo ОШИБКА: pip не найден в текущем Python.
+    pause
+    exit /b 1
+)
+
 REM Устанавливаем PyInstaller если нет
-pip show pyinstaller >nul 2>&1
+python -m pip show pyinstaller >nul 2>&1
 if %errorlevel% neq 0 (
     echo Установка PyInstaller...
-    pip install pyinstaller
+    python -m pip install pyinstaller
 )
 
 REM Устанавливаем Dulwich если нет
-pip show dulwich >nul 2>&1
+python -m pip show dulwich >nul 2>&1
 if %errorlevel% neq 0 (
     echo Установка Dulwich...
-    pip install dulwich
+    python -m pip install dulwich
+)
+
+REM Устанавливаем truststore если нет
+python -m pip show truststore >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Установка truststore...
+    python -m pip install truststore
+)
+
+REM Устанавливаем certifi если нет
+python -m pip show certifi >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Установка certifi...
+    python -m pip install certifi
 )
 
 echo.
 echo Сборка GitMergeMods.exe ...
 echo.
 
-pyinstaller ^
+python -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name GitMergeMods ^
     --clean ^
     --noconfirm ^
+    --collect-data certifi ^
     main.py
 
 if %errorlevel% equ 0 (
