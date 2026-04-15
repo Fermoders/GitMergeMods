@@ -155,22 +155,12 @@ def is_binary(data: bytes) -> bool:
 
 
 def normalize_to_lf(data: bytes) -> bytes:
-    """Нормализует line endings: CRLF → LF для текстовых файлов.
-
-    Git хранит файлы с LF. Если отправить CRLF, весь файл будет показан
-    как изменённый в diff. Нормализуем перед отправкой.
+    """Нормализует line endings: CRLF -> LF для текстовых файлов.
+    Git хранит файлы с LF. Работаем на уровне байтов без decode/encode.
     """
     if is_binary(data):
         return data
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            text = data.decode("cp1251")
-        except Exception:
-            return data
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    return normalized.encode("utf-8")
+    return data.replace(b"\r\n", b"\n")
 
 
 def encode_path_for_url(path: str) -> str:
@@ -2273,21 +2263,22 @@ class MainApp(tk.Tk):
                     next_action = "conflict"
 
                 def decide_action():
-                    if next_action == "local_to_remote":
-                        self._apply_single_change(file_path, "local_to_remote", local_content, remote_content, remote_sha)
-                    elif next_action == "remote_to_local":
-                        self._apply_single_change(file_path, "remote_to_local", local_content, remote_content, remote_sha)
-                    elif next_action == "merge":
-                        self._apply_single_change(file_path, "merge", local_content, remote_content, remote_sha)
-                    elif next_action == "remote_deleted":
-                        self._open_diff_window(
-                            file_path, local_content, remote_content,
-                            remote_sha, "remote_deleted")
-                    else:
-                        # Окно вызывается только для конфликтов
-                        self._open_diff_window(
-                            file_path, local_content, remote_content,
-                            remote_sha, "conflict")
+                    # Определяем статус для DiffWindow
+                    diff_status = file_status
+                    if file_status in ("both_changed", "different_unknown"):
+                        if local_content and remote_content:
+                            mr = self._build_merge_result(
+                                file_path, file_status, local_content, remote_content)
+                            if not mr or not mr.success:
+                                diff_status = "conflict"
+
+                    def on_apply(direction):
+                        self._apply_single_change(
+                            file_path, direction, local_content,
+                            remote_content, remote_sha)
+
+                    DiffWindow(self, file_path, local_content, remote_content,
+                               diff_status, on_apply)
 
                 self.after(0, decide_action)
             except Exception as e:
