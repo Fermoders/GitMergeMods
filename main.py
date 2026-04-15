@@ -2979,7 +2979,7 @@ class MainApp(tk.Tk):
     def _clear_repo(self):
         """Удаляет все файлы из репозитория через REST API."""
         self._operation_active = True
-        self._update_progress(0, "Получение списка файлов...")
+        self._update_progress(0, "Очистка репозитория...")
         self._set_status("🗑 Очистка репозитория...")
 
         def clear_worker():
@@ -2993,36 +2993,67 @@ class MainApp(tk.Tk):
                 n_total = len(remote_tree)
                 self._set_status(f"🗑 Удаление {n_total} файл(ов)...")
 
-                # Собираем SHA для удаления
-                files_to_delete_shas = {}
-                for path, info in remote_tree.items():
-                    files_to_delete_shas[path] = info.get("sha")
+                current_sha = self.github.get_latest_commit_sha()
+                if not current_sha:
+                    self._set_status("⚠ Не удалось получить текущий коммит")
+                    return
 
+                # Создаём dummy blob и дерево с одним .gitkeep
+                self._update_progress(20, "Создание пустого дерева...")
+                content_b64 = base64.b64encode(b"").decode("ascii")
+                blob = self.github._api_request(
+                    "POST",
+                    f"/repos/{self.github.owner}/{self.github.repo}/git/blobs",
+                    data={"content": content_b64, "encoding": "base64"},
+                )
+                if not blob:
+                    self._set_status("⚠ Не удалось создать blob")
+                    return
+
+                # Дерево только с .gitkeep (без base_tree — чистое)
+                new_tree = self.github._api_request(
+                    "POST",
+                    f"/repos/{self.github.owner}/{self.github.repo}/git/trees",
+                    data={"tree": [
+                        {"path": ".gitkeep", "mode": "100644",
+                         "type": "blob", "sha": blob["sha"]},
+                    ]},
+                )
+                if not new_tree:
+                    self._set_status("⚠ Не удалось создать дерево")
+                    return
+
+                self._update_progress(60, "Создание коммита...")
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                message = f"Clear repo: удалено {n_total} файл(ов) [{ts}]"
+                new_commit = self.github._api_request(
+                    "POST",
+                    f"/repos/{self.github.owner}/{self.github.repo}/git/commits",
+                    data={
+                        "message": f"Clear repo: удалено {n_total} файл(ов) [{ts}]",
+                        "tree": new_tree["sha"],
+                        "parents": [current_sha],
+                    },
+                )
+                if not new_commit:
+                    self._set_status("⚠ Не удалось создать коммит")
+                    return
 
-                def on_progress(step_text, percent):
-                    self._update_progress(percent, step_text)
-                    self._set_status(f"🗑 {step_text}")
-
-                ok, _ = self.github.batch_commit(
-                    files_to_upload={},
-                    files_to_delete_shas=files_to_delete_shas,
-                    message=message,
-                    progress_callback=on_progress,
+                self._update_progress(80, "Обновление ветки...")
+                self.github._api_request(
+                    "PATCH",
+                    f"/repos/{self.github.owner}/{self.github.repo}"
+                    f"/git/refs/heads/{self.github.branch}",
+                    data={"sha": new_commit["sha"]},
                 )
 
-                if ok:
-                    with self._lock:
-                        self._synced_state.clear()
-                    self._save_synced_state_to_disk()
-                    self._set_status(
-                        f"✅ Репозиторий очищен — удалено {n_total} файл(ов)")
-                    self._update_progress(100, "✅ Готово")
-                    self.after(1000, self._do_scan)
-                else:
-                    self._set_status("⚠ Не удалось очистить репозиторий")
-                    self._update_progress(0, "Ошибка")
+                with self._lock:
+                    self._synced_state.clear()
+                self._save_synced_state_to_disk()
+                self.github.invalidate_cache()
+                self._set_status(
+                    f"✅ Репозиторий очищен — удалено {n_total} файл(ов)")
+                self._update_progress(100, "✅ Готово")
+                self.after(1000, self._do_scan)
 
             except Exception as e:
                 log_error(f"clear_repo: {e}")
