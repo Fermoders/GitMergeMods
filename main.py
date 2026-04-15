@@ -1497,6 +1497,11 @@ class MainApp(tk.Tk):
             width=24, command=self._upload_all, state="disabled")
         self.upload_all_btn.pack(side="left", padx=4)
 
+        self.clear_repo_btn = ttk.Button(
+            ctrl, text="🗑 Очистить репозиторий",
+            width=22, command=self._clear_repo_confirm, state="disabled")
+        self.clear_repo_btn.pack(side="left", padx=4)
+
         # Режимы
         modes = ttk.Frame(self)
         modes.pack(fill="x", padx=8, pady=2)
@@ -1913,6 +1918,7 @@ class MainApp(tk.Tk):
         self.connect_btn.configure(text="⏹ Отключить")
         self.sync_btn.configure(state="normal")
         self.upload_all_btn.configure(state="normal")
+        self.clear_repo_btn.configure(state="normal")
         self.status_var.set(f"✅ Подключено к {repo_name} ({branch})")
         # Удаляем устаревшие transport-кэши от других репо/веток
         self._cleanup_stale_transport()
@@ -1941,6 +1947,7 @@ class MainApp(tk.Tk):
         self.connect_btn.configure(text="▶ Подключить")
         self.sync_btn.configure(state="disabled")
         self.upload_all_btn.configure(state="disabled")
+        self.clear_repo_btn.configure(state="disabled")
         self.progress_var.set(0)
         self.progress_label.configure(text="")
         self.status_var.set("Отключено")
@@ -2952,6 +2959,79 @@ class MainApp(tk.Tk):
                 self._operation_active = False
 
         threading.Thread(target=upload_worker, daemon=True).start()
+
+    def _clear_repo_confirm(self):
+        """Подтверждение очистки репозитория."""
+        if not self.connected or not self.github or self._operation_active:
+            return
+        if not messagebox.askyesno(
+            "⚠ Очистка репозитория",
+            "ВНИМАНИЕ!\n\n"
+            "Все файлы в репозитории будут удалены.\n"
+            "Это действие необратимо.\n\n"
+            "Локальные файлы НЕ затрагиваются.\n\n"
+            "Продолжить?",
+            icon="warning",
+        ):
+            return
+        self._clear_repo()
+
+    def _clear_repo(self):
+        """Удаляет все файлы из репозитория через REST API."""
+        self._operation_active = True
+        self._update_progress(0, "Получение списка файлов...")
+        self._set_status("🗑 Очистка репозитория...")
+
+        def clear_worker():
+            try:
+                remote_tree, _ = self.github.get_tree()
+                if not remote_tree:
+                    self._set_status("✅ Репозиторий уже пуст")
+                    self._update_progress(100, "")
+                    return
+
+                n_total = len(remote_tree)
+                self._set_status(f"🗑 Удаление {n_total} файл(ов)...")
+
+                # Собираем SHA для удаления
+                files_to_delete_shas = {}
+                for path, info in remote_tree.items():
+                    files_to_delete_shas[path] = info.get("sha")
+
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                message = f"Clear repo: удалено {n_total} файл(ов) [{ts}]"
+
+                def on_progress(step_text, percent):
+                    self._update_progress(percent, step_text)
+                    self._set_status(f"🗑 {step_text}")
+
+                ok, _ = self.github.batch_commit(
+                    files_to_upload={},
+                    files_to_delete_shas=files_to_delete_shas,
+                    message=message,
+                    progress_callback=on_progress,
+                )
+
+                if ok:
+                    with self._lock:
+                        self._synced_state.clear()
+                    self._save_synced_state_to_disk()
+                    self._set_status(
+                        f"✅ Репозиторий очищен — удалено {n_total} файл(ов)")
+                    self._update_progress(100, "✅ Готово")
+                    self.after(1000, self._do_scan)
+                else:
+                    self._set_status("⚠ Не удалось очистить репозиторий")
+                    self._update_progress(0, "Ошибка")
+
+            except Exception as e:
+                log_error(f"clear_repo: {e}")
+                self._set_status(f"⚠ Ошибка очистки: {e}")
+                self._update_progress(0, "Ошибка")
+            finally:
+                self._operation_active = False
+
+        threading.Thread(target=clear_worker, daemon=True).start()
 
     # ---- Обработчики галочек ----
 
