@@ -1723,6 +1723,7 @@ class MainApp(tk.Tk):
             refspecs=f"refs/heads/{self.config.branch}:refs/heads/{self.config.branch}",
             outstream=io.BytesIO(),
             errstream=io.BytesIO(),
+            force=True,
         )
         if pool is not None:
             push_kwargs["pool_manager"] = pool
@@ -1731,35 +1732,10 @@ class MainApp(tk.Tk):
             result = porcelain.push(repo_path, **push_kwargs)
         except Exception as push_err:
             err_text = str(push_err)
-            log_error(f"push attempt 1 failed: {err_text}")
-
-            # Non-fast-forward — pull remote, rebase, и retry push
-            if "main" in err_text or "fast" in err_text.lower() or "reject" in err_text.lower():
-                report("Pull перед retry push...", 88)
-                try:
-                    pull_kwargs = dict(
-                        remote_location=auth_url,
-                        outstream=io.BytesIO(),
-                        errstream=io.BytesIO(),
-                        fast_forward=True,
-                        force=True,
-                    )
-                    if pool is not None:
-                        pull_kwargs["pool_manager"] = pool
-                    porcelain.pull(repo_path, **pull_kwargs)
-                    # Повторный commit после pull (merge)
-                    report("Повторный commit...", 90)
-                    commit_id = porcelain.commit(repo_path, message=message)
-                    report("Retry push...", 92)
-                    result = porcelain.push(repo_path, **push_kwargs)
-                    log_error("push retry succeeded after pull")
-                except Exception as retry_err:
-                    log_error(f"push retry also failed: {retry_err}")
-                    _force_rmtree(repo_path)
-                    raise Exception(f"Push не удался после retry: {retry_err}")
-            else:
-                _force_rmtree(repo_path)
-                raise
+            log_error(f"push failed: {err_text}")
+            # Удаляем transport repo чтобы при следующей попытке был clean clone
+            _force_rmtree(repo_path)
+            raise
 
         # dulwich porcelain.push возвращает dict {ref: error_or_None}
         # или объект с ref_status
