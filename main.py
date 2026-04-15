@@ -1566,6 +1566,9 @@ class MainApp(tk.Tk):
                 clone_kwargs["pool_manager"] = pool
             porcelain.clone(auth_url, target=repo_path, **clone_kwargs)
 
+        if not self.connected:
+            raise Exception("Отключено — transport clone отменён")
+
         git_dir = os.path.join(repo_path, ".git")
         if not os.path.isdir(git_dir):
             fresh_clone()
@@ -1592,6 +1595,8 @@ class MainApp(tk.Tk):
             porcelain.pull(repo_path, **pull_kwargs)
             return repo_path
         except Exception as e:
+            if not self.connected:
+                raise
             log_error(f"transport pull failed, re-cloning: {e}")
             fresh_clone()
             return repo_path
@@ -1812,15 +1817,26 @@ class MainApp(tk.Tk):
         self._auto_connect_enabled = False
         self._cancel_connect_retry()
         self.connected = False
+        self._operation_active = False
+        self.scanning = False
         if self._scan_after_id:
             self.after_cancel(self._scan_after_id)
             self._scan_after_id = None
         self.connect_btn.configure(text="▶ Подключить")
         self.sync_btn.configure(state="disabled")
         self.upload_all_btn.configure(state="disabled")
+        self.progress_var.set(0)
+        self.progress_label.configure(text="")
         self.status_var.set("Отключено")
         self.tree.delete(*self.tree.get_children())
         self.changes = []
+        self.local_files = {}
+        self.remote_tree = {}
+        with self._lock:
+            self._synced_state = {}
+        self.github = None
+        self.scanner = None
+        self._cleanup_transport()
 
     def _cleanup_stale_transport(self):
         """Удаляет transport-кэши от других репозиториев/веток,
@@ -1878,6 +1894,8 @@ class MainApp(tk.Tk):
                                if self.scanner else {})
                 remote_tree, commit_sha = (
                     self.github.get_tree() if self.github else ({}, None))
+                if not self.connected:
+                    return
                 with self._lock:
                     synced_state = dict(self._synced_state)
                 changes = FileScanner.compare(local_files, remote_tree, synced_state)
@@ -2315,6 +2333,8 @@ class MainApp(tk.Tk):
 
             # === Фаза 2: batch-коммит ===
             n_batch = len(files_to_upload)
+            if not self.connected:
+                return
             if files_to_upload:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 message = (f"Auto-sync: {n_batch} файл(ов) "
@@ -2353,6 +2373,8 @@ class MainApp(tk.Tk):
                     log_error(f"auto_push transport_push: {e}")
 
             # === Фаза 3: скачиваем remote_only ===
+            if not self.connected:
+                return
             n_dl = len(files_to_download)
             if files_to_download:
                 self._update_progress(92, f"Скачивание {n_dl} файл(ов)")
@@ -2512,6 +2534,8 @@ class MainApp(tk.Tk):
                 count = 0
                 processed = 0
                 for path, info in remote_tree.items():
+                    if not self.connected:
+                        return
                     processed += 1
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
@@ -2590,6 +2614,9 @@ class MainApp(tk.Tk):
                     with open(info["full_path"], "rb") as f:
                         files_to_upload[path] = f.read()
 
+                if not self.connected:
+                    self._set_status("Отключено")
+                    return
                 if not files_to_upload:
                     self._set_status("✅ Все файлы уже синхронизированы")
                     self._update_progress(100, "")
