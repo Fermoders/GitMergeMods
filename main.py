@@ -693,9 +693,11 @@ class FileScanner:
 
             if local and not remote:
                 changes.append({
-                    "path": path, "status": "local_only",
+                    "path": path,
+                    "status": "remote_deleted" if synced_sha else "local_only",
                     "local_hash": local["hash"], "remote_sha": None,
                     "full_path": local["full_path"],
+                    "synced_sha": synced_sha,
                 })
             elif remote and not local:
                 changes.append({
@@ -890,8 +892,10 @@ class ConflictDialog(tk.Toplevel):
 # ============================================================
 
 class DiffWindow(tk.Toplevel):
-    TAG_ADDED = "added"
-    TAG_REMOVED = "removed"
+    TAG_LINE_ADDED = "line_added"
+    TAG_LINE_REMOVED = "line_removed"
+    TAG_CHAR_ADDED = "char_added"
+    TAG_CHAR_REMOVED = "char_removed"
 
     @staticmethod
     def _make_action_button(parent, text, command, bg, fg="white"):
@@ -921,6 +925,9 @@ class DiffWindow(tk.Toplevel):
 
         self.on_apply = on_apply_callback
         self.file_path = file_path
+        self.local_content = local_content or b""
+        self.remote_content = remote_content or b""
+        self.local_status = local_status
 
         # === Информация ===
         info_frame = ttk.Frame(self)
@@ -929,6 +936,7 @@ class DiffWindow(tk.Toplevel):
         status_text = {
             "local_only": "📄 Только локально",
             "remote_only": "☁️ Только в репозитории",
+            "remote_deleted": "🗑 Удален из репозитория",
             "local_changed": "📝 Изменён локально",
             "remote_changed": "☁️ Изменён в репозитории",
             "both_changed": "⚠ Изменён локально и в репозитории",
@@ -941,6 +949,14 @@ class DiffWindow(tk.Toplevel):
             font=("Segoe UI", 10, "bold"),
         ).pack(anchor="w")
         ttk.Label(info_frame, text=status_text, foreground="#555").pack(anchor="w")
+
+        self.only_changes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            info_frame,
+            text="Показывать только изменения",
+            variable=self.only_changes_var,
+            command=self._rerender_texts,
+        ).pack(anchor="w", pady=(4, 0))
 
         # === Side-by-side Diff ===
         diff_container = ttk.PanedWindow(self, orient="horizontal")
@@ -977,12 +993,16 @@ class DiffWindow(tk.Toplevel):
         self.remote_text.pack(fill="both", expand=True)
 
         for widget in (self.local_text, self.remote_text):
-            widget.tag_configure(self.TAG_ADDED, background="#264f78",
-                                 foreground="#d4d4d4")
-            widget.tag_configure(self.TAG_REMOVED, background="#5a1d1d",
-                                 foreground="#d4d4d4")
+            widget.tag_configure(self.TAG_LINE_ADDED, background="#1f5d2f",
+                                 foreground="#ffffff")
+            widget.tag_configure(self.TAG_LINE_REMOVED, background="#8b5a00",
+                                 foreground="#ffffff")
+            widget.tag_configure(self.TAG_CHAR_ADDED, background="#2e8b57",
+                                 foreground="#ffffff")
+            widget.tag_configure(self.TAG_CHAR_REMOVED, background="#cc8400",
+                                 foreground="#ffffff")
 
-        self._populate_texts(local_content, remote_content)
+        self._rerender_texts()
         self.local_text.configure(state="disabled")
         self.remote_text.configure(state="disabled")
 
@@ -1010,7 +1030,7 @@ class DiffWindow(tk.Toplevel):
         btn_frame.pack(fill="x", padx=8, pady=8)
 
         merge_possible = False
-        if local_content is not None and remote_content is not None:
+        if local_content is not None and remote_content is not None and local_status != "remote_deleted":
             mr = merge_text_contents(local_content, remote_content, file_path)
             merge_possible = mr.success
 
@@ -1028,6 +1048,9 @@ class DiffWindow(tk.Toplevel):
         elif local_status in ("remote_only", "remote_changed"):
             remote_color = GREEN
             merge_color = GREEN
+        elif local_status == "remote_deleted":
+            local_color = GREEN
+            remote_color = RED
         elif local_status == "both_changed":
             if merge_possible:
                 merge_color = GREEN
@@ -1047,21 +1070,35 @@ class DiffWindow(tk.Toplevel):
             remote_color = RED
             merge_color = RED
 
+        left_button_text = "← Отправить локальную в Репо"
+        right_button_text = "Скачать из Репо → Локально"
+        right_button_action = "remote_to_local"
+        show_merge_button = local_status in (
+            "local_changed", "remote_changed", "both_changed",
+            "different_unknown", "local_only", "remote_only"
+        )
+
+        if local_status == "remote_deleted":
+            left_button_text = "📤 Отправить в репозиторий"
+            right_button_text = "🗑 Удалить локальный"
+            right_button_action = "delete_local"
+            show_merge_button = False
+
         self._make_action_button(
             btn_frame,
-            "← Отправить локальную в Репо",
+            left_button_text,
             lambda: self._apply("local_to_remote"),
             local_color,
         ).pack(side="left", padx=4)
 
         self._make_action_button(
             btn_frame,
-            "Скачать из Репо → Локально",
-            lambda: self._apply("remote_to_local"),
+            right_button_text,
+            lambda: self._apply(right_button_action),
             remote_color,
         ).pack(side="left", padx=4)
 
-        if local_status in ("local_changed", "remote_changed", "both_changed", "different_unknown", "local_only", "remote_only"):
+        if show_merge_button:
             self._make_action_button(
                 btn_frame,
                 "🔀 Слить обе версии",
@@ -1095,6 +1132,15 @@ class DiffWindow(tk.Toplevel):
             self._syncing_scroll = False
         return on_scroll
 
+    def _rerender_texts(self):
+        self.local_text.configure(state="normal")
+        self.remote_text.configure(state="normal")
+        self.local_text.delete("1.0", "end")
+        self.remote_text.delete("1.0", "end")
+        self._populate_texts(self.local_content, self.remote_content)
+        self.local_text.configure(state="disabled")
+        self.remote_text.configure(state="disabled")
+
     def _populate_texts(self, local_content, remote_content):
         local_bin = local_content or b""
         remote_bin = remote_content or b""
@@ -1125,47 +1171,56 @@ class DiffWindow(tk.Toplevel):
         matcher = difflib.SequenceMatcher(None, remote_lines, local_lines)
         local_out, remote_out = [], []
         local_tags, remote_tags = [], []
+        local_char_tags, remote_char_tags = [], []
+        show_only = self.only_changes_var.get()
 
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == "equal":
-                for k in range(i2 - i1):
-                    line = remote_lines[i1 + k]
-                    remote_out.append(line)
-                    local_out.append(line)
+                if not show_only:
+                    for k in range(i2 - i1):
+                        line = remote_lines[i1 + k]
+                        remote_out.append(line)
+                        local_out.append(line)
             elif tag == "replace":
-                for k in range(i1, i2):
-                    remote_out.append(remote_lines[k])
-                    remote_tags.append((len(remote_out), self.TAG_REMOVED))
-                for k in range(j1, j2):
-                    local_out.append(local_lines[k])
-                    local_tags.append((len(local_out), self.TAG_ADDED))
-                diff = (j2 - j1) - (i2 - i1)
-                if diff > 0:
-                    for _ in range(diff):
-                        remote_out.append("")
-                elif diff < 0:
-                    for _ in range(-diff):
-                        local_out.append("")
+                max_len = max(i2 - i1, j2 - j1)
+                for idx in range(max_len):
+                    remote_line = remote_lines[i1 + idx] if i1 + idx < i2 else ""
+                    local_line = local_lines[j1 + idx] if j1 + idx < j2 else ""
+                    remote_out.append(remote_line)
+                    local_out.append(local_line)
+                    local_tags.append((len(local_out), self.TAG_LINE_ADDED))
+                    remote_tags.append((len(remote_out), self.TAG_LINE_REMOVED))
+
+                    char_ops = difflib.SequenceMatcher(None, remote_line, local_line).get_opcodes()
+                    line_no = len(local_out)
+                    for ctag, ci1, ci2, cj1, cj2 in char_ops:
+                        if ctag in ("replace", "insert") and local_line:
+                            local_char_tags.append((line_no, cj1, cj2, self.TAG_CHAR_ADDED))
+                        if ctag in ("replace", "delete") and remote_line:
+                            remote_char_tags.append((line_no, ci1, ci2, self.TAG_CHAR_REMOVED))
             elif tag == "delete":
                 for k in range(i1, i2):
                     remote_out.append(remote_lines[k])
-                    remote_tags.append((len(remote_out), self.TAG_REMOVED))
+                    remote_tags.append((len(remote_out), self.TAG_LINE_REMOVED))
                     local_out.append("")
             elif tag == "insert":
                 for k in range(j1, j2):
                     local_out.append(local_lines[k])
-                    local_tags.append((len(local_out), self.TAG_ADDED))
+                    local_tags.append((len(local_out), self.TAG_LINE_ADDED))
                     remote_out.append("")
 
-        self._fill_panel(self.local_text, local_out, local_tags)
-        self._fill_panel(self.remote_text, remote_out, remote_tags)
+        self._fill_panel(self.local_text, local_out, local_tags, local_char_tags)
+        self._fill_panel(self.remote_text, remote_out, remote_tags, remote_char_tags)
 
     @staticmethod
-    def _fill_panel(text_widget, lines, tags):
+    def _fill_panel(text_widget, lines, tags, char_tags=None):
         content = "\n".join(lines)
         text_widget.insert("1.0", content)
         for line_no, tag_name in tags:
             text_widget.tag_add(tag_name, f"{line_no}.0", f"{line_no}.end")
+        for line_no, start_col, end_col, tag_name in (char_tags or []):
+            if end_col > start_col:
+                text_widget.tag_add(tag_name, f"{line_no}.{start_col}", f"{line_no}.{end_col}")
 
     def _apply(self, direction):
         self.on_apply(direction)
@@ -1305,6 +1360,7 @@ class MainApp(tk.Tk):
 
         self.tree.tag_configure("local_only", background="#d4edda")
         self.tree.tag_configure("remote_only", background="#cce5ff")
+        self.tree.tag_configure("remote_deleted", background="#ffe0b3")
         self.tree.tag_configure("local_changed", background="#d4edda")
         self.tree.tag_configure("remote_changed", background="#cce5ff")
         self.tree.tag_configure("both_changed", background="#f8d7da")
@@ -1553,6 +1609,7 @@ class MainApp(tk.Tk):
         STATUS_TEXT = {
             "local_only": "Только локально",
             "remote_only": "Только в репо",
+            "remote_deleted": "Удален из репозитория",
             "local_changed": "Изменён локально",
             "remote_changed": "Изменён в репозитории",
             "both_changed": "Изменён с обеих сторон",
@@ -1561,6 +1618,7 @@ class MainApp(tk.Tk):
         DIR_TEXT = {
             "local_only": "локальн. → репо",
             "remote_only": "репо → локальн.",
+            "remote_deleted": "выбор: вернуть / удалить локально",
             "local_changed": "локальн. → репо",
             "remote_changed": "репо → локальн.",
             "both_changed": "нужен мерж / выбор",
@@ -1694,6 +1752,8 @@ class MainApp(tk.Tk):
                     mr = self._build_merge_result(
                         file_path, file_status, local_content, remote_content)
                     next_action = "merge" if (mr and mr.success) else "conflict"
+                elif file_status == "remote_deleted":
+                    next_action = "remote_deleted"
                 else:
                     next_action = "conflict"
 
@@ -1704,6 +1764,10 @@ class MainApp(tk.Tk):
                         self._apply_single_change(file_path, "remote_to_local", local_content, remote_content, remote_sha)
                     elif next_action == "merge":
                         self._apply_single_change(file_path, "merge", local_content, remote_content, remote_sha)
+                    elif next_action == "remote_deleted":
+                        self._open_diff_window(
+                            file_path, local_content, remote_content,
+                            remote_sha, "remote_deleted")
                     else:
                         # Окно вызывается только для конфликтов
                         self._open_diff_window(
@@ -1802,6 +1866,14 @@ class MainApp(tk.Tk):
                         self._synced_state[file_path] = remote_sha
                 self._save_synced_state_to_disk()
                 self.status_var.set(f"✅ {file_path} загружен локально")
+
+            elif direction == "delete_local":
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                with self._lock:
+                    self._synced_state.pop(file_path, None)
+                self._save_synced_state_to_disk()
+                self.status_var.set(f"✅ {file_path} удален локально")
 
             elif direction == "merge":
                 if local_content is None or remote_content is None:
