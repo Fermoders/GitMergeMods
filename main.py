@@ -1627,6 +1627,9 @@ class MainApp(tk.Tk):
         os.makedirs(TRANSPORT_ROOT, exist_ok=True)
 
         def fresh_clone():
+            # Сборка мусора — освободить файловые хэндлы dulwich
+            import gc
+            gc.collect()
             if os.path.exists(repo_path):
                 _force_rmtree(repo_path)
             report("Клонирование transport-репозитория...", 3)
@@ -1652,8 +1655,11 @@ class MainApp(tk.Tk):
             return repo_path
 
         try:
+            # Проверяем только staged-изменения (unstaged — норма после pull)
             status_obj = porcelain.status(repo_path)
-            if self._dulwich_status_has_changes(status_obj):
+            staged = status_obj.staged if status_obj.staged else {}
+            has_staged = any(bool(v) for v in staged.values()) if isinstance(staged, dict) else bool(staged)
+            if has_staged:
                 report("Очистка transport-репозитория...", 2)
                 fresh_clone()
                 return repo_path
@@ -2361,7 +2367,8 @@ class MainApp(tk.Tk):
             f"🔄 Авто-синхронизация: {n_total} изменений...")
 
         def auto_worker():
-            files_to_upload = {}
+            new_files = {}       # local_only → transport batch push
+            changed_files = {}  # local_changed / merged → REST API batch_commit
             files_to_download = {}
             conflict_list = []
             errors = []
@@ -2374,18 +2381,26 @@ class MainApp(tk.Tk):
                     path = change["path"]
                     status = change["status"]
                     short = os.path.basename(path)
-                    pct = int((idx / max(n_total, 1)) * 40)
+                    pct = int((idx / max(n_total, 1)) * 20)
                     self._update_progress(pct, f"Анализ: {short}")
                     self._set_status(
                         f"🔄 Анализ: {short} ({idx + 1}/{n_total})")
 
-                    if status in ("local_only", "local_changed"):
+                    if status == "local_only":
                         full_path = change.get("full_path") or os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
                         if os.path.isfile(full_path):
                             with open(full_path, "rb") as f:
-                                files_to_upload[path] = f.read()
+                                new_files[path] = f.read()
+
+                    elif status == "local_changed":
+                        full_path = change.get("full_path") or os.path.join(
+                            self.config.local_folder,
+                            path.replace("/", os.sep))
+                        if os.path.isfile(full_path):
+                            with open(full_path, "rb") as f:
+                                changed_files[path] = f.read()
 
                     elif status in ("remote_only", "remote_changed"):
                         remote_content, remote_sha = (
@@ -2415,7 +2430,7 @@ class MainApp(tk.Tk):
                             path, status, local_bytes, remote_content)
 
                         if mr and mr.success:
-                            files_to_upload[path] = mr.content
+                            changed_files[path] = mr.content
                         else:
                             conflict_list.append((
                                 path, local_bytes,
@@ -2425,33 +2440,61 @@ class MainApp(tk.Tk):
                     errors.append(f"{path}: {e}")
                     log_error(f"auto_push analyze [{path}]: {e}")
 
-            # === Фаза 2: batch-коммит ===
-            n_batch = len(files_to_upload)
+            # === Фаза 2: transport batch push — только новые файлы ===
+            n_new = len(new_files)
             if not self.connected:
                 return
-            if files_to_upload:
+            if new_files:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                message = (f"Auto-sync: {n_batch} файл(ов) "
-                           f"обновлено [{ts}]")
+                message = f"Auto-sync: {n_new} новых файл(ов) [{ts}]"
 
                 def on_batch_progress(step_text, percent):
-                    mapped = 40 + int(percent * 0.5)
+                    mapped = 20 + int(percent * 0.3)
                     self._update_progress(mapped, step_text)
-                    self._set_status(f"📤 {step_text} ({n_batch} файл(ов))")
+                    self._set_status(f"📤 {step_text}")
 
                 try:
                     ok, commit_sha = self._transport_batch_push(
-                        files_to_upload, message=message,
+                        new_files, message=message,
                         progress_callback=on_batch_progress)
                     if ok:
-                        # Обновляем synced_state для отправленных файлов
                         new_tree, _ = self.github.get_tree()
                         with self._lock:
-                            for path, content in files_to_upload.items():
+                            for path, content in new_files.items():
                                 new_sha = new_tree.get(path, {}).get("sha")
                                 if new_sha:
                                     self._synced_state[path] = new_sha
-                                # Обновляем локальные файлы
+                        self._save_synced_state_to_disk()
+                    else:
+                        log_error(f"auto_push: transport push вернул False")
+                except Exception as e:
+                    errors.append(f"Transport push: {e}")
+                    log_error(f"auto_push transport_push: {e}")
+
+            # === Фаза 3: REST API batch_commit — изменённые файлы ===
+            n_changed = len(changed_files)
+            if not self.connected:
+                return
+            if changed_files:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                message = f"Auto-sync: {n_changed} обновлён(ых) [{ts}]"
+
+                def on_rest_progress(step_text, percent):
+                    mapped = 50 + int(percent * 0.4)
+                    self._update_progress(mapped, step_text)
+                    self._set_status(f"📤 {step_text}")
+
+                try:
+                    ok, commit_sha = self.github.batch_commit(
+                        changed_files, message=message,
+                        progress_callback=on_rest_progress)
+                    if ok:
+                        new_tree, _ = self.github.get_tree()
+                        with self._lock:
+                            for path, content in changed_files.items():
+                                new_sha = new_tree.get(path, {}).get("sha")
+                                if new_sha:
+                                    self._synced_state[path] = new_sha
                                 local_path = os.path.join(
                                     self.config.local_folder,
                                     path.replace("/", os.sep))
@@ -2461,12 +2504,12 @@ class MainApp(tk.Tk):
                                     f.write(content)
                         self._save_synced_state_to_disk()
                     else:
-                        log_error(f"auto_push: transport push вернул False для {n_batch} файлов")
+                        log_error(f"auto_push: REST batch_commit вернул False")
                 except Exception as e:
-                    errors.append(f"Transport push: {e}")
-                    log_error(f"auto_push transport_push: {e}")
+                    errors.append(f"REST commit: {e}")
+                    log_error(f"auto_push rest_commit: {e}")
 
-            # === Фаза 3: скачиваем remote_only ===
+            # === Фаза 4: скачиваем remote_only ===
             if not self.connected:
                 return
             n_dl = len(files_to_download)
@@ -2497,15 +2540,15 @@ class MainApp(tk.Tk):
                         errors.append(f"Download {path}: {e}")
                         log_error(f"auto_push download [{path}]: {e}")
 
-            # === Фаза 4: конфликты ===
+            # === Фаза 5: конфликты ===
             if conflict_list:
                 self.after(0, lambda: self._show_conflicts(conflict_list))
-                # Не снимаем _operation_active — конфликты разберёт пользователь
-                # _operation_active снимется в _process_next_conflict когда очередь пуста
             else:
                 msg = "✅ Синхронизация завершена"
-                if n_batch:
-                    msg += f" | Отправлено: {n_batch}"
+                if n_new:
+                    msg += f" | Новых: {n_new}"
+                if n_changed:
+                    msg += f" | Обновлено: {n_changed}"
                 if n_dl:
                     msg += f" | Скачано: {n_dl}"
                 if errors:
