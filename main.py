@@ -1596,12 +1596,11 @@ class MainApp(tk.Tk):
         def fresh_clone():
             if os.path.exists(repo_path):
                 _force_rmtree(repo_path)
-            report("Клонирование transport-репозитория (shallow)...", 3)
+            report("Клонирование transport-репозитория...", 3)
             pool = get_urllib3_pool_manager()
             clone_kwargs = dict(
                 checkout=True,
                 branch=self.config.branch,
-                depth=1,
                 outstream=io.BytesIO(),
                 errstream=io.BytesIO(),
             )
@@ -1692,11 +1691,26 @@ class MainApp(tk.Tk):
         )
         if pool is not None:
             push_kwargs["pool_manager"] = pool
-        result = porcelain.push(repo_path, **push_kwargs)
 
-        ref_status = getattr(result, "ref_status", None) or {}
-        failures = {k: v for k, v in ref_status.items() if v}
+        try:
+            result = porcelain.push(repo_path, **push_kwargs)
+        except Exception as push_err:
+            log_error(f"push failed: {push_err}")
+            # Push не удался — clean-ап transport repo чтобы следующий раз был fresh clone
+            _force_rmtree(repo_path)
+            raise
+
+        # dulwich porcelain.push возвращает dict {ref: error_or_None}
+        # или объект с ref_status
+        if isinstance(result, dict):
+            failures = {k: v for k, v in result.items() if v}
+        else:
+            ref_status = getattr(result, "ref_status", None) or {}
+            failures = {k: v for k, v in ref_status.items() if v}
+
         if failures:
+            log_error(f"push rejected: {failures}")
+            _force_rmtree(repo_path)
             raise Exception(f"Push отклонен: {failures}")
 
         report("Готово", 100)
