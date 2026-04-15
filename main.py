@@ -161,9 +161,39 @@ def _force_rmtree(path):
     На Windows dulwich создаёт read-only файлы в .git/objects/pack/,
     из-за чего shutil.rmtree() молча не может их удалить (ignore_errors=True)
     и следующий clone падает с WinError 183.
+
+    Стратегия: двухпроходная — сначала снимаем read-only со всех файлов,
+    потом удаляем через shutil.rmtree.
     """
     import stat
 
+    if not os.path.isdir(path):
+        return
+
+    # Проход 1: снимаем read-only со всех файлов и каталогов
+    try:
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                fp = os.path.join(root, name)
+                try:
+                    os.chmod(fp, stat.S_IWRITE)
+                except Exception:
+                    pass
+            for name in dirs:
+                dp = os.path.join(root, name)
+                try:
+                    os.chmod(dp, stat.S_IWRITE)
+                except Exception:
+                    pass
+        # Также снимаем с корня
+        try:
+            os.chmod(path, stat.S_IWRITE)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Проход 2: удаляем через rmtree с onerror-обработчиком
     def on_error(func, filepath, exc_info):
         try:
             os.chmod(filepath, stat.S_IWRITE)
@@ -172,10 +202,12 @@ def _force_rmtree(path):
             pass
 
     try:
-        if os.path.isdir(path):
-            shutil.rmtree(path, onerror=on_error)
+        shutil.rmtree(path, onerror=on_error)
     except Exception:
-        # Последняя попытка — через 2 прохода
+        pass
+
+    # Проход 3 (страховочный): ручное удаление остатков
+    if os.path.isdir(path):
         try:
             for root, dirs, files in os.walk(path, topdown=False):
                 for f in files:
@@ -187,7 +219,8 @@ def _force_rmtree(path):
                         pass
                 for d in dirs:
                     try:
-                        os.rmdir(os.path.join(root, d))
+                        dp = os.path.join(root, d)
+                        os.rmdir(dp)
                     except Exception:
                         pass
             try:
@@ -1612,7 +1645,9 @@ class MainApp(tk.Tk):
             raise Exception("Отключено — transport clone отменён")
 
         git_dir = os.path.join(repo_path, ".git")
-        if not os.path.isdir(git_dir):
+        # Если репо отсутствует или shallow (от предыдущей версии) — полный clone
+        shallow_marker = os.path.join(git_dir, "shallow")
+        if not os.path.isdir(git_dir) or os.path.isfile(shallow_marker):
             fresh_clone()
             return repo_path
 
@@ -1695,10 +1730,36 @@ class MainApp(tk.Tk):
         try:
             result = porcelain.push(repo_path, **push_kwargs)
         except Exception as push_err:
-            log_error(f"push failed: {push_err}")
-            # Push не удался — clean-ап transport repo чтобы следующий раз был fresh clone
-            _force_rmtree(repo_path)
-            raise
+            err_text = str(push_err)
+            log_error(f"push attempt 1 failed: {err_text}")
+
+            # Non-fast-forward — pull remote, rebase, и retry push
+            if "main" in err_text or "fast" in err_text.lower() or "reject" in err_text.lower():
+                report("Pull перед retry push...", 88)
+                try:
+                    pull_kwargs = dict(
+                        remote_location=auth_url,
+                        outstream=io.BytesIO(),
+                        errstream=io.BytesIO(),
+                        fast_forward=True,
+                        force=True,
+                    )
+                    if pool is not None:
+                        pull_kwargs["pool_manager"] = pool
+                    porcelain.pull(repo_path, **pull_kwargs)
+                    # Повторный commit после pull (merge)
+                    report("Повторный commit...", 90)
+                    commit_id = porcelain.commit(repo_path, message=message)
+                    report("Retry push...", 92)
+                    result = porcelain.push(repo_path, **push_kwargs)
+                    log_error("push retry succeeded after pull")
+                except Exception as retry_err:
+                    log_error(f"push retry also failed: {retry_err}")
+                    _force_rmtree(repo_path)
+                    raise Exception(f"Push не удался после retry: {retry_err}")
+            else:
+                _force_rmtree(repo_path)
+                raise
 
         # dulwich porcelain.push возвращает dict {ref: error_or_None}
         # или объект с ref_status
