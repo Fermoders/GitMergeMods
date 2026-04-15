@@ -26,7 +26,7 @@ import re
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.1"
+APP_VERSION = "1.3"
 SCAN_INTERVAL_SEC = 5
 API_BASE = "https://api.github.com"
 
@@ -36,6 +36,22 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(APP_DIR, "gitmergemods_config.json")
+LOG_FILE = os.path.join(APP_DIR, "gitmergemods_errors.log")
+
+
+# ============================================================
+# Логирование
+# ============================================================
+
+def log_error(msg):
+    """Записывает ошибку в лог-файл с таймстемпом."""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -910,6 +926,7 @@ class MainApp(tk.Tk):
         self.scanner = None
         self.connected = False
         self.scanning = False
+        self._operation_active = False  # True = идёт отправка/скачивание
         self.changes = []
         self.local_files = {}
         self.remote_tree = {}
@@ -1162,8 +1179,8 @@ class MainApp(tk.Tk):
             self._scan_after_id = self.after(0, self._do_scan)
 
     def _do_scan(self):
-        if not self.connected or self.scanning:
-            if self.connected:
+        if not self.connected or self.scanning or self._operation_active:
+            if self.connected and not self._operation_active:
                 self._scan_after_id = self.after(
                     SCAN_INTERVAL_SEC * 1000, self._do_scan)
             return
@@ -1264,7 +1281,33 @@ class MainApp(tk.Tk):
             local_info = self.local_files.get(file_path)
             remote_info = self.remote_tree.get(file_path)
 
+        # Если не нашли в кэше — пробуем построить путь напрямую
+        if not local_info:
+            direct_path = os.path.join(
+                self.config.local_folder,
+                file_path.replace("/", os.sep))
+            if os.path.isfile(direct_path):
+                try:
+                    with open(direct_path, "rb") as f:
+                        content = f.read()
+                    local_info = {
+                        "hash": compute_git_blob_hash(content),
+                        "full_path": direct_path,
+                        "size": len(content),
+                    }
+                except Exception:
+                    pass
+
+        if not remote_info and self.remote_tree:
+            # Попробуем найти по частичному совпадению
+            for rp, rv in self.remote_tree.items():
+                if rp == file_path or rp.endswith(file_path):
+                    remote_info = rv
+                    break
+
         if not local_info and not remote_info:
+            log_error(f"show_diff: файл не найден ни локально, ни в репо: {file_path}")
+            self._set_status(f"⚠ Файл не найден: {file_path}")
             return
 
         local_content = None
@@ -1296,6 +1339,7 @@ class MainApp(tk.Tk):
                     file_path, local_content, remote_content,
                     remote_sha, status))
             except Exception as e:
+                log_error(f"show_diff [{file_path}]: {e}")
                 self.after(0, lambda: messagebox.showerror(
                     "Ошибка", str(e)))
 
@@ -1313,6 +1357,12 @@ class MainApp(tk.Tk):
     def _apply_single_change(self, file_path, direction, local_content,
                               remote_content, remote_sha):
         """Ручное применение одного изменения из DiffWindow."""
+        if self._operation_active:
+            messagebox.showwarning("Подождите",
+                "Другая операция ещё выполняется. Дождитесь завершения.")
+            return
+
+        self._operation_active = True
         try:
             local_path = os.path.join(
                 self.config.local_folder,
@@ -1389,8 +1439,11 @@ class MainApp(tk.Tk):
             self.after(1000, self._do_scan)
 
         except Exception as e:
+            log_error(f"apply_single [{file_path}] dir={direction}: {e}")
             messagebox.showerror("Ошибка", str(e))
             self.status_var.set(f"⚠ Ошибка: {e}")
+        finally:
+            self._operation_active = False
 
     # ================================================================
     # АВТО-ПУШ: batch-мерж + конфликт-диалог
@@ -1403,6 +1456,10 @@ class MainApp(tk.Tk):
         if not changes:
             return
 
+        if self._operation_active:
+            return  # Другая операция ещё идёт
+
+        self._operation_active = True
         n_total = len(changes)
         self._update_progress(0, "Анализ...")
         self._set_status(
@@ -1468,6 +1525,7 @@ class MainApp(tk.Tk):
 
                 except Exception as e:
                     errors.append(f"{path}: {e}")
+                    log_error(f"auto_push analyze [{path}]: {e}")
 
             # === Фаза 2: batch-коммит ===
             n_batch = len(files_to_upload)
@@ -1477,7 +1535,6 @@ class MainApp(tk.Tk):
                            f"обновлено [{ts}]")
 
                 def on_batch_progress(step_text, percent):
-                    # Маппим 40-90% диапазон
                     mapped = 40 + int(percent * 0.5)
                     self._update_progress(mapped, step_text)
                     self._set_status(f"📤 {step_text} ({n_batch} файл(ов))")
@@ -1495,8 +1552,11 @@ class MainApp(tk.Tk):
                                         exist_ok=True)
                             with open(local_path, "wb") as f:
                                 f.write(content)
+                    else:
+                        log_error(f"auto_push: batch_commit вернул False для {n_batch} файлов")
                 except Exception as e:
                     errors.append(f"Batch commit: {e}")
+                    log_error(f"auto_push batch_commit: {e}")
 
             # === Фаза 3: скачиваем remote_only ===
             n_dl = len(files_to_download)
@@ -1521,11 +1581,13 @@ class MainApp(tk.Tk):
                             f.write(content)
                     except Exception as e:
                         errors.append(f"Download {path}: {e}")
+                        log_error(f"auto_push download [{path}]: {e}")
 
             # === Фаза 4: конфликты ===
-            n_conflicts = len(conflict_list)
             if conflict_list:
                 self.after(0, lambda: self._show_conflicts(conflict_list))
+                # Не снимаем _operation_active — конфликты разберёт пользователь
+                # _operation_active снимется в _process_next_conflict когда очередь пуста
             else:
                 msg = "✅ Синхронизация завершена"
                 if n_batch:
@@ -1536,8 +1598,7 @@ class MainApp(tk.Tk):
                     msg += f" | Ошибок: {len(errors)}"
                 self._set_status(msg)
                 self._update_progress(100, "✅ Готово")
-
-            if not conflict_list:
+                self._operation_active = False
                 self.after(2000, self._do_scan)
 
         threading.Thread(target=auto_worker, daemon=True).start()
@@ -1551,6 +1612,7 @@ class MainApp(tk.Tk):
         if not self._conflict_queue:
             self.status_var.set(
                 "✅ Все конфликты разрешены. Сканирование...")
+            self._operation_active = False
             self.after(2000, self._do_scan)
             return
 
@@ -1615,6 +1677,7 @@ class MainApp(tk.Tk):
                 self.status_var.set(f"⏭ {path} — пропущен")
 
         except Exception as e:
+            log_error(f"conflict_action [{path}] action={action}: {e}")
             self.status_var.set(f"⚠ Ошибка для {path}: {e}")
 
         # Следующий конфликт
@@ -1623,9 +1686,10 @@ class MainApp(tk.Tk):
     # ---- Полная синхронизация ----
 
     def _download_all(self):
-        if not self.connected or not self.github:
+        if not self.connected or not self.github or self._operation_active:
             return
 
+        self._operation_active = True
         self._update_progress(0, "Подготовка...")
         self._set_status("📥 Загрузка всех файлов из репозитория...")
 
@@ -1674,15 +1738,19 @@ class MainApp(tk.Tk):
                 self.after(1000, self._do_scan)
 
             except Exception as e:
+                log_error(f"download_all: {e}")
                 self._set_status(f"⚠ Ошибка загрузки: {e}")
                 self._update_progress(0, "Ошибка")
+            finally:
+                self._operation_active = False
 
         threading.Thread(target=download_worker, daemon=True).start()
 
     def _upload_all(self):
-        if not self.connected or not self.github:
+        if not self.connected or not self.github or self._operation_active:
             return
 
+        self._operation_active = True
         self._update_progress(0, "Подготовка...")
         self._set_status("📤 Отправка всех файлов в репозиторий...")
 
@@ -1694,10 +1762,7 @@ class MainApp(tk.Tk):
 
                 # Собираем файлы для отправки
                 files_to_upload = {}
-                total_all = len(local_files)
-                idx = 0
                 for path, info in local_files.items():
-                    idx += 1
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
                         if ext not in self.config.extensions:
@@ -1738,12 +1803,16 @@ class MainApp(tk.Tk):
                 else:
                     self._set_status("⚠ Ошибка batch-коммита")
                     self._update_progress(0, "Ошибка")
+                    log_error(f"upload_all: batch_commit вернул False для {n_files} файлов")
 
                 self.after(1000, self._do_scan)
 
             except Exception as e:
+                log_error(f"upload_all: {e}")
                 self._set_status(f"⚠ Ошибка отправки: {e}")
                 self._update_progress(0, "Ошибка")
+            finally:
+                self._operation_active = False
 
         threading.Thread(target=upload_worker, daemon=True).start()
 
