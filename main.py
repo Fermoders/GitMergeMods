@@ -327,6 +327,7 @@ class Config:
         "local_folder": "",
         "branch": "main",
         "auto_push": False,
+        "auto_merge_update": True,
         "filter_extensions": False,
         "extensions": [".xml", ".txt"],
     }
@@ -732,6 +733,23 @@ class FileScanner:
 class ConflictDialog(tk.Toplevel):
     """Большой диалог для разрешения конфликта с красным предупреждением."""
 
+    @staticmethod
+    def _danger_button(parent, text, command):
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg="#cc0000",
+            fg="white",
+            activebackground="#cc0000",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=8,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        )
+
     def __init__(self, parent, file_path, local_content, remote_content,
                  remote_sha, on_resolve_callback):
         super().__init__(parent)
@@ -793,23 +811,18 @@ class ConflictDialog(tk.Toplevel):
             wraplength=650,
         ).pack(anchor="w")
 
-        # Мерж-информация
-        mr = merge_text_contents(local_content, remote_content, file_path)
-        if not mr.success:
-            conflict_count = len(mr.conflicts)
-            merge_label = tk.Label(
-                info_frame,
-                text=f"⚠ Конфликтующих блоков: {conflict_count} — "
-                     f"автоматический мерж невозможен",
-                fg="#cc0000", font=("Segoe UI", 10, "bold"),
-            )
-            merge_label.pack(anchor="w", pady=(4, 0))
+        merge_label = tk.Label(
+            info_frame,
+            text="⚠ Конфликт изменений — автоматическое применение отключено",
+            fg="#cc0000", font=("Segoe UI", 10, "bold"),
+        )
+        merge_label.pack(anchor="w", pady=(4, 0))
 
         # === Кнопки действий ===
         btn_frame = ttk.Frame(self, padding=8)
         btn_frame.pack(fill="x", padx=8, pady=8)
 
-        ttk.Button(
+        self._danger_button(
             btn_frame,
             text="📤 Отправить свой файл в репозиторий",
             command=lambda: self._resolve("push_local"),
@@ -823,7 +836,7 @@ class ConflictDialog(tk.Toplevel):
 
         ttk.Separator(btn_frame).pack(fill="x", pady=6)
 
-        ttk.Button(
+        self._danger_button(
             btn_frame,
             text="📥 Скачать из репозитория (вы потеряете свои изменения!)",
             command=lambda: self._resolve("pull_remote"),
@@ -837,7 +850,7 @@ class ConflictDialog(tk.Toplevel):
 
         ttk.Separator(btn_frame).pack(fill="x", pady=6)
 
-        ttk.Button(
+        self._danger_button(
             btn_frame,
             text="💾 Сохранить обе версии (.local файл)",
             command=lambda: self._resolve("save_both"),
@@ -851,7 +864,7 @@ class ConflictDialog(tk.Toplevel):
 
         ttk.Separator(btn_frame).pack(fill="x", pady=6)
 
-        ttk.Button(
+        self._danger_button(
             btn_frame,
             text="❌ Отмена — пропустить файл",
             command=self._cancel,
@@ -880,6 +893,23 @@ class DiffWindow(tk.Toplevel):
     TAG_ADDED = "added"
     TAG_REMOVED = "removed"
 
+    @staticmethod
+    def _make_action_button(parent, text, command, bg, fg="white"):
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=bg,
+            activeforeground=fg,
+            relief="flat",
+            padx=10,
+            pady=6,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        )
+
     def __init__(self, parent, file_path, local_content, remote_content,
                  local_status, on_apply_callback):
         super().__init__(parent)
@@ -903,6 +933,7 @@ class DiffWindow(tk.Toplevel):
             "remote_changed": "☁️ Изменён в репозитории",
             "both_changed": "⚠ Изменён локально и в репозитории",
             "different_unknown": "⚡ Версии различаются",
+            "conflict": "⛔ Конфликт изменений",
         }.get(local_status, local_status)
 
         ttk.Label(
@@ -978,24 +1009,77 @@ class DiffWindow(tk.Toplevel):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", padx=8, pady=8)
 
-        ttk.Button(
-            btn_frame, text="← Отправить локальную в Репо",
-            command=lambda: self._apply("local_to_remote"),
+        merge_possible = False
+        if local_content is not None and remote_content is not None:
+            mr = merge_text_contents(local_content, remote_content, file_path)
+            merge_possible = mr.success
+
+        GREEN = "#2e8b57"
+        RED = "#cc0000"
+        GREY = "#666666"
+
+        local_color = GREY
+        remote_color = GREY
+        merge_color = GREY
+
+        if local_status in ("local_only", "local_changed"):
+            local_color = GREEN
+            merge_color = GREEN
+        elif local_status in ("remote_only", "remote_changed"):
+            remote_color = GREEN
+            merge_color = GREEN
+        elif local_status == "both_changed":
+            if merge_possible:
+                merge_color = GREEN
+            else:
+                local_color = RED
+                remote_color = RED
+                merge_color = RED
+        elif local_status == "different_unknown":
+            if merge_possible:
+                merge_color = GREEN
+            else:
+                local_color = RED
+                remote_color = RED
+                merge_color = RED
+        elif local_status == "conflict":
+            local_color = RED
+            remote_color = RED
+            merge_color = RED
+
+        self._make_action_button(
+            btn_frame,
+            "← Отправить локальную в Репо",
+            lambda: self._apply("local_to_remote"),
+            local_color,
         ).pack(side="left", padx=4)
 
-        ttk.Button(
-            btn_frame, text="Скачать из Репо → Локально",
-            command=lambda: self._apply("remote_to_local"),
+        self._make_action_button(
+            btn_frame,
+            "Скачать из Репо → Локально",
+            lambda: self._apply("remote_to_local"),
+            remote_color,
         ).pack(side="left", padx=4)
 
-        if local_status in ("local_changed", "remote_changed", "both_changed", "different_unknown"):
-            ttk.Button(
-                btn_frame, text="🔀 Слить обе версии",
-                command=lambda: self._apply("merge"),
+        if local_status in ("local_changed", "remote_changed", "both_changed", "different_unknown", "local_only", "remote_only"):
+            self._make_action_button(
+                btn_frame,
+                "🔀 Слить обе версии",
+                lambda: self._apply("merge"),
+                merge_color,
             ).pack(side="left", padx=4)
 
-        ttk.Button(
-            btn_frame, text="Закрыть", command=self.destroy,
+        tk.Button(
+            btn_frame,
+            text="Закрыть",
+            command=self.destroy,
+            bg="#444444",
+            fg="white",
+            activebackground="#444444",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=6,
         ).pack(side="right", padx=4)
 
         self._syncing_scroll = False
@@ -1185,6 +1269,12 @@ class MainApp(tk.Tk):
             variable=self.auto_push_var,
             command=self._on_auto_push_toggle).pack(side="left", padx=8)
 
+        self.auto_merge_update_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            modes, text="🧩 Авто мерж-обновление",
+            variable=self.auto_merge_update_var,
+            command=self._on_auto_merge_toggle).pack(side="left", padx=8)
+
         self.filter_var = tk.BooleanVar()
         ttk.Checkbutton(
             modes, text="📋 Только .xml / .txt",
@@ -1292,6 +1382,7 @@ class MainApp(tk.Tk):
         self.folder_var.set(self.config.local_folder)
         self.branch_var.set(self.config.branch)
         self.auto_push_var.set(self.config.auto_push)
+        self.auto_merge_update_var.set(self.config.auto_merge_update)
         self.filter_var.set(self.config.filter_extensions)
 
     def _save_config_from_ui(self):
@@ -1300,6 +1391,7 @@ class MainApp(tk.Tk):
         self.config.local_folder = self.folder_var.get().strip()
         self.config.branch = self.branch_var.get().strip() or "main"
         self.config.auto_push = self.auto_push_var.get()
+        self.config.auto_merge_update = self.auto_merge_update_var.get()
         self.config.filter_extensions = self.filter_var.get()
         self.config.save()
 
@@ -1495,6 +1587,38 @@ class MainApp(tk.Tk):
             f"✅ Синхронизировано: {synced} | "
             f"Изменений: {n_changes} | Проверка: {now}")
 
+    def _build_merge_result(self, file_path, file_status, local_content, remote_content):
+        """Возвращает результат мержа с учётом baseline для both_changed."""
+        if local_content is None or remote_content is None:
+            return None
+
+        if file_status == "both_changed":
+            with self._lock:
+                base_sha = self._synced_state.get(file_path)
+            base_content = self.github.get_blob_content(base_sha) if (self.github and base_sha) else None
+            if base_content is not None:
+                return three_way_merge(base_content, local_content, remote_content, file_path)
+
+        return merge_text_contents(local_content, remote_content, file_path)
+
+    def _handle_non_conflict_direct_sync(self, file_path, file_status, local_content, remote_content, remote_sha):
+        """Для неконфликтных файлов синхронизирует сразу без окна."""
+        if file_status in ("local_only", "local_changed"):
+            self._apply_single_change(file_path, "local_to_remote", local_content, remote_content, remote_sha)
+            return True
+
+        if file_status in ("remote_only", "remote_changed"):
+            self._apply_single_change(file_path, "remote_to_local", local_content, remote_content, remote_sha)
+            return True
+
+        if file_status in ("both_changed", "different_unknown"):
+            mr = self._build_merge_result(file_path, file_status, local_content, remote_content)
+            if mr and mr.success:
+                self._apply_single_change(file_path, "merge", local_content, remote_content, remote_sha)
+                return True
+
+        return False
+
     # ---- Двойной клик → Diff ----
 
     def _on_double_click(self, event):
@@ -1561,9 +1685,32 @@ class MainApp(tk.Tk):
                     remote_content, remote_sha = (
                         self.github.get_file_content(file_path))
 
-                self.after(0, lambda: self._open_diff_window(
-                    file_path, local_content, remote_content,
-                    remote_sha, file_status))
+                next_action = None
+                if file_status in ("local_only", "local_changed"):
+                    next_action = "local_to_remote"
+                elif file_status in ("remote_only", "remote_changed"):
+                    next_action = "remote_to_local"
+                elif file_status in ("both_changed", "different_unknown"):
+                    mr = self._build_merge_result(
+                        file_path, file_status, local_content, remote_content)
+                    next_action = "merge" if (mr and mr.success) else "conflict"
+                else:
+                    next_action = "conflict"
+
+                def decide_action():
+                    if next_action == "local_to_remote":
+                        self._apply_single_change(file_path, "local_to_remote", local_content, remote_content, remote_sha)
+                    elif next_action == "remote_to_local":
+                        self._apply_single_change(file_path, "remote_to_local", local_content, remote_content, remote_sha)
+                    elif next_action == "merge":
+                        self._apply_single_change(file_path, "merge", local_content, remote_content, remote_sha)
+                    else:
+                        # Окно вызывается только для конфликтов
+                        self._open_diff_window(
+                            file_path, local_content, remote_content,
+                            remote_sha, "conflict")
+
+                self.after(0, decide_action)
             except Exception as e:
                 log_error(f"show_diff [{file_path}]: {e}")
                 self.after(0, lambda: messagebox.showerror(
@@ -1606,8 +1753,8 @@ class MainApp(tk.Tk):
                 fresh_remote, fresh_sha = (
                     self.github.get_file_content(file_path))
                 if fresh_remote and fresh_sha and fresh_sha != remote_sha:
-                    mr = merge_text_contents(
-                        local_content, fresh_remote, file_path)
+                    mr = self._build_merge_result(
+                        file_path, "both_changed", local_content, fresh_remote)
                     if mr.success:
                         self.github.upload_file(
                             file_path, mr.content, existing_sha=fresh_sha)
@@ -1662,10 +1809,12 @@ class MainApp(tk.Tk):
                     return
                 with self._lock:
                     base_sha = self._synced_state.get(file_path)
-                base_content = self.github.get_blob_content(base_sha) if base_sha else None
-                mr = (three_way_merge(base_content, local_content, remote_content, file_path)
-                      if base_content is not None else
-                      merge_text_contents(local_content, remote_content, file_path))
+                mr = self._build_merge_result(
+                    file_path,
+                    "both_changed" if base_sha else "different_unknown",
+                    local_content,
+                    remote_content,
+                )
                 if mr.success:
                     os.makedirs(os.path.dirname(local_path), exist_ok=True)
                     with open(local_path, "wb") as f:
@@ -1752,6 +1901,9 @@ class MainApp(tk.Tk):
                                 remote_content, remote_sha)
 
                     elif status in ("both_changed", "different_unknown"):
+                        if not self.auto_merge_update_var.get():
+                            continue
+
                         local_path = os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -1765,22 +1917,10 @@ class MainApp(tk.Tk):
                         if remote_content is None:
                             continue
 
-                        with self._lock:
-                            base_sha = self._synced_state.get(path)
+                        mr = self._build_merge_result(
+                            path, status, local_bytes, remote_content)
 
-                        if base_sha:
-                            base_content = self.github.get_blob_content(base_sha)
-                            if base_content is not None:
-                                mr = three_way_merge(
-                                    base_content, local_bytes, remote_content, path)
-                            else:
-                                mr = merge_text_contents(
-                                    local_bytes, remote_content, path)
-                        else:
-                            mr = merge_text_contents(
-                                local_bytes, remote_content, path)
-
-                        if mr.success:
+                        if mr and mr.success:
                             files_to_upload[path] = mr.content
                         else:
                             conflict_list.append((
@@ -2117,6 +2257,10 @@ class MainApp(tk.Tk):
 
     def _on_auto_push_toggle(self):
         self.config.auto_push = self.auto_push_var.get()
+        self.config.save()
+
+    def _on_auto_merge_toggle(self):
+        self.config.auto_merge_update = self.auto_merge_update_var.get()
         self.config.save()
 
     def _on_filter_toggle(self):
