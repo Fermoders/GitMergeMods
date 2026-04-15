@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitMergeMods v1.0
+GitMergeMods v1.1
 Легковесное приложение для синхронизации файлов модов с GitHub.
 Работает через GitHub REST API — не требует установки Git.
-Все функции в одном файле. Собирается в один .exe через PyInstaller.
+Batch-коммиты, мерж по умолчанию, конфликт-диалог.
 """
 
 import os
@@ -26,11 +26,10 @@ import re
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 SCAN_INTERVAL_SEC = 5
 API_BASE = "https://api.github.com"
 
-# Определяем папку приложения (рядом с .exe или .py)
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
 else:
@@ -44,25 +43,16 @@ CONFIG_FILE = os.path.join(APP_DIR, "gitmergemods_config.json")
 # ============================================================
 
 def compute_git_blob_hash(data: bytes) -> str:
-    """Вычисляет SHA-1 хеш blob-объекта Git (для сравнения с GitHub tree)."""
     header = f"blob {len(data)}\0".encode("ascii")
     return hashlib.sha1(header + data).hexdigest()
 
 
 def normalize_path(path: str) -> str:
-    """Нормализует путь: \\ → /, нижний регистр для сравнения."""
     return path.replace("\\", "/")
 
 
 def is_binary(data: bytes) -> bool:
-    """Определяет, являются ли данные бинарными (простая эвристика)."""
-    if b"\x00" in data[:8192]:
-        return True
-    return False
-
-
-def get_app_dir():
-    return APP_DIR
+    return b"\x00" in data[:8192]
 
 
 # ============================================================
@@ -70,38 +60,22 @@ def get_app_dir():
 # ============================================================
 
 class MergeResult:
-    """Результат попытки мержа двух версий файла."""
-
     def __init__(self, success, content=None, conflicts=None,
                  local_only_lines=0, remote_only_lines=0):
-        self.success = success           # True если чистый мерж
-        self.content = content           # bytes — результат мержа
-        self.conflicts = conflicts or []  # список строк с конфликтами
+        self.success = success
+        self.content = content
+        self.conflicts = conflicts or []
         self.local_only_lines = local_only_lines
         self.remote_only_lines = remote_only_lines
 
 
 def merge_text_contents(local_content: bytes, remote_content: bytes,
                         path: str = "") -> MergeResult:
-    """
-    Пытается смержить локальную и удалённую версии текстового файла.
-
-    Стратегия:
-    1. Если одна сторона пуста — берём непустую (чистое добавление).
-    2. Если файлы бинарные — мерж невозможен, возвращаем конфликт.
-    3. Line-by-line merge через difflib.SequenceMatcher:
-       - Общие строки → берём как есть
-       - Строки только локально → добавляем (вставляем)
-       - Строки только в репо → добавляем (вставляем)
-       - Если изменения в одном и том же блоке — КОНФЛИКТ
-    """
-    # Одна сторона пуста
     if not local_content:
         return MergeResult(success=True, content=remote_content)
     if not remote_content:
         return MergeResult(success=True, content=local_content)
 
-    # Бинарные файлы
     if is_binary(local_content) or is_binary(remote_content):
         return MergeResult(
             success=False,
@@ -113,11 +87,9 @@ def merge_text_contents(local_content: bytes, remote_content: bytes,
     local_lines = local_text.splitlines()
     remote_lines = remote_text.splitlines()
 
-    # Если полностью совпадают — конфликтов нет
     if local_lines == remote_lines:
         return MergeResult(success=True, content=local_content)
 
-    # Line-by-line merge
     merged = []
     conflicts = []
     local_added = 0
@@ -130,25 +102,18 @@ def merge_text_contents(local_content: bytes, remote_content: bytes,
         if tag == "equal":
             merged.extend(remote_lines[i1:i2])
         elif tag == "insert":
-            # Строки добавлены только локально
             merged.extend(local_lines[j1:j2])
             local_added += (j2 - j1)
         elif tag == "delete":
-            # Строки удалены из репо (были в remote, нет в local)
-            # Трактуем как: локально их удалили — не берём
-            remote_added += 0  # удаление не считается добавлением
+            pass  # локально удалены — не берём
         elif tag == "replace":
-            # Обе стороны изменили один блок → КОНФЛИКТ
             remote_block = remote_lines[i1:i2]
             local_block = local_lines[j1:j2]
-
-            # Пытаемся разрешить: если блоки совпадают — не конфликт
             if remote_block == local_block:
                 merged.extend(remote_block)
             else:
-                # Реальный конфликт — включаем обе версии с маркерами
                 conflicts.append(
-                    f"Строки {len(merged) + 1}-{len(merged) + 1 + (j2-j1) + 5 + (i2-i1)}"
+                    f"Строки {len(merged) + 1}-{len(merged) + 1 + (j2 - j1) + 5 + (i2 - i1)}"
                 )
                 merged.append("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ")
                 merged.extend(local_block)
@@ -165,51 +130,31 @@ def merge_text_contents(local_content: bytes, remote_content: bytes,
 
     if conflicts:
         return MergeResult(
-            success=False,
-            content=result_bytes,
-            conflicts=conflicts,
-            local_only_lines=local_added,
-            remote_only_lines=remote_added,
+            success=False, content=result_bytes, conflicts=conflicts,
+            local_only_lines=local_added, remote_only_lines=remote_added,
         )
-    else:
-        return MergeResult(
-            success=True,
-            content=result_bytes,
-            local_only_lines=local_added,
-            remote_only_lines=remote_added,
-        )
+    return MergeResult(
+        success=True, content=result_bytes,
+        local_only_lines=local_added, remote_only_lines=remote_added,
+    )
 
 
-def save_conflict_files(local_folder: str, rel_path: str,
-                         local_content: bytes, remote_content: bytes):
-    """
-    При неразрешимом конфликте сохраняет обе версии:
-      file.xml       — remote версия (актуальная из репо)
-      file.xml.local — локальная версия
-    """
+def save_conflict_files(local_folder, rel_path, local_content, remote_content):
     local_path = os.path.join(local_folder, rel_path.replace("/", os.sep))
     backup_path = local_path + ".local"
-
     os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-
-    # Сохраняем локальную версию в .local
     with open(backup_path, "wb") as f:
         f.write(local_content)
-
-    # Сохраняем remote версию как основную
     with open(local_path, "wb") as f:
         f.write(remote_content)
-
     return backup_path
 
 
 # ============================================================
-# Конфигурация (сохраняется рядом с .exe)
+# Конфигурация
 # ============================================================
 
 class Config:
-    """Загрузка/сохранение настроек в JSON."""
-
     DEFAULTS = {
         "token": "",
         "repo_url": "",
@@ -218,7 +163,6 @@ class Config:
         "auto_push": False,
         "filter_extensions": False,
         "extensions": [".xml", ".txt"],
-        "conflict_resolution": "remote",  # "remote" | "local"
     }
 
     def __init__(self):
@@ -251,20 +195,17 @@ class Config:
 # ============================================================
 
 class GitHubClient:
-    """Полноценный клиент GitHub API v3. Не требует установки Git."""
+    """Клиент GitHub API v3 с поддержкой batch-коммитов через Git Data API."""
 
-    def __init__(self, token: str, repo_url: str, branch: str = "main"):
+    def __init__(self, token, repo_url, branch="main"):
         self.token = token
         self.branch = branch
         self.owner, self.repo = self._parse_repo_url(repo_url)
         self._cached_tree = None
         self._cached_commit_sha = None
 
-    # ---- Парсинг URL ----
-
     @staticmethod
-    def _parse_repo_url(url: str):
-        """Извлекает owner и repo из URL репозитория."""
+    def _parse_repo_url(url):
         url = url.strip().rstrip("/")
         if url.endswith(".git"):
             url = url[:-4]
@@ -275,9 +216,7 @@ class GitHubClient:
             return match.group(1), match.group(2)
         raise ValueError(f"Не удалось распознать URL: {url}")
 
-    # ---- HTTP запросы ----
-
-    def _api_request(self, method: str, endpoint: str, data=None, params=None):
+    def _api_request(self, method, endpoint, data=None, params=None):
         url = f"{API_BASE}{endpoint}"
         if params:
             url += "&" if "?" in url else "?"
@@ -288,7 +227,6 @@ class GitHubClient:
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
         }
-
         body = json.dumps(data).encode("utf-8") if data else None
         req = Request(url, data=body, headers=headers, method=method)
         if body:
@@ -312,18 +250,10 @@ class GitHubClient:
         except Exception as e:
             raise Exception(f"Ошибка запроса: {e}")
 
-    # ---- Основные операции ----
+    # ---- Базовые операции ----
 
     def test_connection(self):
-        """Проверяет доступность репозитория. Возвращает инфо о репо или None."""
         return self._api_request("GET", f"/repos/{self.owner}/{self.repo}")
-
-    def get_default_branch(self):
-        """Получает имя ветки по умолчанию."""
-        info = self.test_connection()
-        if info:
-            return info.get("default_branch", "main")
-        return "main"
 
     def get_latest_commit_sha(self):
         data = self._api_request(
@@ -334,10 +264,6 @@ class GitHubClient:
         return None
 
     def get_tree(self):
-        """
-        Получает полное дерево файлов репозитория.
-        Возвращает (dict: path → {sha, size}, commit_sha).
-        """
         commit_sha = self.get_latest_commit_sha()
         if not commit_sha:
             return {}, None
@@ -364,12 +290,7 @@ class GitHubClient:
         self._cached_commit_sha = commit_sha
         return tree, commit_sha
 
-    def get_file_content(self, path: str):
-        """
-        Получает содержимое файла из репозитория.
-        Возвращает (bytes, blob_sha) или (None, None).
-        """
-        # Пробуем через Contents API (до 1 МБ)
+    def get_file_content(self, path):
         data = self._api_request(
             "GET",
             f"/repos/{self.owner}/{self.repo}/contents/{path}",
@@ -379,7 +300,6 @@ class GitHubClient:
             raw = base64.b64decode(data["content"].replace("\n", ""))
             return raw, data.get("sha")
 
-        # Файл слишком большой — через Blob API
         tree, _ = self.get_tree()
         if path in tree:
             blob_sha = tree[path]["sha"]
@@ -391,45 +311,131 @@ class GitHubClient:
                 return raw, blob_sha
         return None, None
 
-    def upload_file(self, path: str, content: bytes, existing_sha: str = None):
-        """Создаёт или обновляет файл в репозитории."""
+    # ---- Batch-коммит через Git Data API ----
+
+    def create_blob(self, content):
+        """Создаёт blob и возвращает его SHA."""
+        content_b64 = base64.b64encode(content).decode("ascii")
+        data = self._api_request(
+            "POST",
+            f"/repos/{self.owner}/{self.repo}/git/blobs",
+            data={"content": content_b64, "encoding": "base64"},
+        )
+        if data and "sha" in data:
+            return data["sha"]
+        raise Exception("Не удалось создать blob")
+
+    def batch_commit(self, files_to_upload, files_to_delete_shas=None,
+                     message=None):
+        """
+        Создаёт один коммит с несколькими файлами через Git Data API.
+
+        files_to_upload: dict {path: bytes_content}
+        files_to_delete_shas: dict {path: remote_sha} — файлы для удаления
+        message: текст коммита (если None — автогенерация)
+
+        Возвращает (success: bool, new_commit_sha: str | None)
+        """
+        if not files_to_upload and not files_to_delete_shas:
+            return True, None
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not message:
+            n_up = len(files_to_upload)
+            n_del = len(files_to_delete_shas or {})
+            parts = []
+            if n_up:
+                parts.append(f"{n_up} файл(ов) обновлено")
+            if n_del:
+                parts.append(f"{n_del} файл(ов) удалено")
+            message = f"Auto-sync: {', '.join(parts)} [{ts}]"
+
+        # 1. Текущий коммит и его дерево
+        current_sha = self.get_latest_commit_sha()
+        if not current_sha:
+            return False, None
+
+        commit_data = self._api_request(
+            "GET", f"/repos/{self.owner}/{self.repo}/git/commits/{current_sha}"
+        )
+        if not commit_data:
+            return False, None
+        base_tree_sha = commit_data["tree"]["sha"]
+
+        # 2. Создаём blobs для файлов
+        tree_entries = []
+        for path, content in files_to_upload.items():
+            blob_sha = self.create_blob(content)
+            tree_entries.append({
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_sha,
+            })
+
+        # Удаления: SHA = null в tree
+        if files_to_delete_shas:
+            for path in files_to_delete_shas:
+                tree_entries.append({
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": None,
+                })
+
+        # 3. Создаём новое дерево
+        new_tree = self._api_request(
+            "POST",
+            f"/repos/{self.owner}/{self.repo}/git/trees",
+            data={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+        if not new_tree:
+            return False, None
+        new_tree_sha = new_tree["sha"]
+
+        # 4. Создаём коммит
+        new_commit = self._api_request(
+            "POST",
+            f"/repos/{self.owner}/{self.repo}/git/commits",
+            data={
+                "message": message,
+                "tree": new_tree_sha,
+                "parents": [current_sha],
+            },
+        )
+        if not new_commit:
+            return False, None
+        new_commit_sha = new_commit["sha"]
+
+        # 5. Обновляем ссылку ветки
+        result = self._api_request(
+            "PATCH",
+            f"/repos/{self.owner}/{self.repo}/git/refs/heads/{self.branch}",
+            data={"sha": new_commit_sha, "force": False},
+        )
+        if not result:
+            return False, None
+
+        self.invalidate_cache()
+        return True, new_commit_sha
+
+    def upload_file(self, path, content, existing_sha=None):
+        """Загрузка одного файла (для ручного разрешения конфликтов)."""
         content_b64 = base64.b64encode(content).decode("ascii")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        message = f"Auto-sync {path} [{ts}]"
-
         payload = {
-            "message": message,
+            "message": f"Auto-sync {path} [{ts}]",
             "content": content_b64,
             "branch": self.branch,
         }
         if existing_sha:
             payload["sha"] = existing_sha
-
         result = self._api_request(
             "PUT",
             f"/repos/{self.owner}/{self.repo}/contents/{path}",
             data=payload,
         )
-        # Сбрасываем кэш
-        self._cached_commit_sha = None
-        self._cached_tree = None
-        return result
-
-    def delete_file(self, path: str, sha: str):
-        """Удаляет файл из репозитория."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        payload = {
-            "message": f"Auto-sync delete {path} [{ts}]",
-            "sha": sha,
-            "branch": self.branch,
-        }
-        result = self._api_request(
-            "DELETE",
-            f"/repos/{self.owner}/{self.repo}/contents/{path}",
-            data=payload,
-        )
-        self._cached_commit_sha = None
-        self._cached_tree = None
+        self.invalidate_cache()
         return result
 
     def invalidate_cache(self):
@@ -442,31 +448,23 @@ class GitHubClient:
 # ============================================================
 
 class FileScanner:
-    """Сканирует локальную папку и сравнивает с удалённым деревом."""
-
-    def __init__(self, local_folder: str, extensions_filter=None):
+    def __init__(self, local_folder, extensions_filter=None):
         self.local_folder = local_folder
-        self.extensions_filter = extensions_filter  # None = все файлы
+        self.extensions_filter = extensions_filter
 
     def scan_local(self):
-        """
-        Сканирует локальную папку.
-        Возвращает dict: normalize_path → {hash, full_path, size}.
-        """
         result = {}
         if not os.path.isdir(self.local_folder):
             return result
 
         for root, dirs, files in os.walk(self.local_folder):
-            # Пропускаем скрытые и системные папки
             dirs[:] = [
-                d
-                for d in dirs
+                d for d in dirs
                 if not d.startswith(".")
                 and d.lower() not in ("__pycache__", "node_modules")
             ]
             for fname in files:
-                if fname.startswith("."):
+                if fname.startswith(".") or fname.endswith(".local"):
                     continue
                 full_path = os.path.join(root, fname)
                 rel_path = os.path.relpath(full_path, self.local_folder)
@@ -492,20 +490,6 @@ class FileScanner:
 
     @staticmethod
     def compare(local_files, remote_tree):
-        """
-        Сравнивает локальные и удалённые файлы.
-        Возвращает список изменений:
-        [
-            {
-                "path": str,
-                "status": "local_only" | "remote_only" | "changed" | "synced",
-                "local_hash": str | None,
-                "remote_sha": str | None,
-                "full_path": str,
-            },
-            ...
-        ]
-        """
         all_paths = set(local_files.keys()) | set(remote_tree.keys())
         changes = []
 
@@ -514,50 +498,182 @@ class FileScanner:
             remote = remote_tree.get(path)
 
             if local and not remote:
-                changes.append(
-                    {
-                        "path": path,
-                        "status": "local_only",
-                        "local_hash": local["hash"],
-                        "remote_sha": None,
-                        "full_path": local["full_path"],
-                    }
-                )
+                changes.append({
+                    "path": path, "status": "local_only",
+                    "local_hash": local["hash"], "remote_sha": None,
+                    "full_path": local["full_path"],
+                })
             elif remote and not local:
-                changes.append(
-                    {
-                        "path": path,
-                        "status": "remote_only",
-                        "local_hash": None,
-                        "remote_sha": remote["sha"],
-                        "full_path": path,
-                    }
-                )
+                changes.append({
+                    "path": path, "status": "remote_only",
+                    "local_hash": None, "remote_sha": remote["sha"],
+                    "full_path": path,
+                })
             elif local["hash"] != remote["sha"]:
-                changes.append(
-                    {
-                        "path": path,
-                        "status": "changed",
-                        "local_hash": local["hash"],
-                        "remote_sha": remote["sha"],
-                        "full_path": local["full_path"],
-                    }
-                )
-            # synced — пропускаем
+                changes.append({
+                    "path": path, "status": "changed",
+                    "local_hash": local["hash"],
+                    "remote_sha": remote["sha"],
+                    "full_path": local["full_path"],
+                })
 
         return changes
 
 
 # ============================================================
-# Окно просмотра Diff (Toplevel)
+# Окно конфликта (большой красный диалог)
+# ============================================================
+
+class ConflictDialog(tk.Toplevel):
+    """Большой диалог для разрешения конфликта с красным предупреждением."""
+
+    def __init__(self, parent, file_path, local_content, remote_content,
+                 remote_sha, on_resolve_callback):
+        super().__init__(parent)
+        self.title(f"⚠ КОНФЛИКТ: {os.path.basename(file_path)}")
+        self.geometry("700x420")
+        self.minsize(550, 350)
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(True, True)
+
+        self.on_resolve = on_resolve_callback
+        self.file_path = file_path
+        self.local_content = local_content
+        self.remote_content = remote_content
+        self.remote_sha = remote_sha
+        self._resolved = False
+
+        # === Красное предупреждение ===
+        warn_frame = tk.Frame(self, bg="#cc0000", padx=12, pady=10)
+        warn_frame.pack(fill="x", padx=0, pady=0)
+
+        tk.Label(
+            warn_frame,
+            text="⚠  КОНФЛИКТ ИЗМЕНЕНИЙ!  ⚠",
+            font=("Segoe UI", 16, "bold"),
+            fg="white", bg="#cc0000",
+        ).pack(anchor="center")
+
+        tk.Label(
+            warn_frame,
+            text=f"Файл изменён и локально, и в репозитории.\n"
+                 f"Выберите действие для: {file_path}",
+            font=("Segoe UI", 11),
+            fg="#ffeeee", bg="#cc0000",
+            justify="center",
+        ).pack(anchor="center", pady=(4, 0))
+
+        # === Информация о файле ===
+        info_frame = ttk.Frame(self, padding=10)
+        info_frame.pack(fill="x", padx=8, pady=4)
+
+        local_size = len(local_content) if local_content else 0
+        remote_size = len(remote_content) if remote_content else 0
+
+        local_lines = (
+            local_content.decode("utf-8", errors="replace").count("\n") + 1
+            if local_content else 0
+        )
+        remote_lines = (
+            remote_content.decode("utf-8", errors="replace").count("\n") + 1
+            if remote_content else 0
+        )
+
+        ttk.Label(
+            info_frame,
+            text=f"📁 {file_path}\n"
+                 f"Локально: {local_size} байт, {local_lines} строк  |  "
+                 f"Репозиторий: {remote_size} байт, {remote_lines} строк",
+            wraplength=650,
+        ).pack(anchor="w")
+
+        # Мерж-информация
+        mr = merge_text_contents(local_content, remote_content, file_path)
+        if not mr.success:
+            conflict_count = len(mr.conflicts)
+            merge_label = tk.Label(
+                info_frame,
+                text=f"⚠ Конфликтующих блоков: {conflict_count} — "
+                     f"автоматический мерж невозможен",
+                fg="#cc0000", font=("Segoe UI", 10, "bold"),
+            )
+            merge_label.pack(anchor="w", pady=(4, 0))
+
+        # === Кнопки действий ===
+        btn_frame = ttk.Frame(self, padding=8)
+        btn_frame.pack(fill="x", padx=8, pady=8)
+
+        ttk.Button(
+            btn_frame,
+            text="📤 Отправить свой файл в репозиторий",
+            command=lambda: self._resolve("push_local"),
+        ).pack(fill="x", pady=3)
+
+        ttk.Label(
+            btn_frame,
+            text="Ваша версия заменит файл в репозитории",
+            foreground="#888",
+        ).pack(anchor="w", padx=4)
+
+        ttk.Separator(btn_frame).pack(fill="x", pady=6)
+
+        ttk.Button(
+            btn_frame,
+            text="📥 Скачать из репозитория (вы потеряете свои изменения!)",
+            command=lambda: self._resolve("pull_remote"),
+        ).pack(fill="x", pady=3)
+
+        tk.Label(
+            btn_frame,
+            text="ВНИМАНИЕ: Ваши локальные изменения будут заменены!",
+            fg="#cc0000", font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", padx=4)
+
+        ttk.Separator(btn_frame).pack(fill="x", pady=6)
+
+        ttk.Button(
+            btn_frame,
+            text="💾 Сохранить обе версии (.local файл)",
+            command=lambda: self._resolve("save_both"),
+        ).pack(fill="x", pady=3)
+
+        ttk.Label(
+            btn_frame,
+            text="Репо-версия → основной файл, ваша → файл.local",
+            foreground="#888",
+        ).pack(anchor="w", padx=4)
+
+        ttk.Separator(btn_frame).pack(fill="x", pady=6)
+
+        ttk.Button(
+            btn_frame,
+            text="❌ Отмена — пропустить файл",
+            command=self._cancel,
+        ).pack(fill="x", pady=3)
+
+    def _resolve(self, action):
+        self._resolved = True
+        self.on_resolve(action)
+        self.destroy()
+
+    def _cancel(self):
+        self._resolved = False
+        self.destroy()
+
+    def destroy(self):
+        if not self._resolved:
+            self.on_resolve("skip")
+        super().destroy()
+
+
+# ============================================================
+# Окно просмотра Diff
 # ============================================================
 
 class DiffWindow(tk.Toplevel):
-    """Окно с side-by-side сравнением локальной и удалённой версий файла."""
-
     TAG_ADDED = "added"
     TAG_REMOVED = "removed"
-    TAG_HEADER = "header"
 
     def __init__(self, parent, file_path, local_content, remote_content,
                  local_status, on_apply_callback):
@@ -570,21 +686,20 @@ class DiffWindow(tk.Toplevel):
 
         self.on_apply = on_apply_callback
         self.file_path = file_path
-        self.local_content = local_content
-        self.remote_content = remote_content
 
-        # === Информационная панель ===
+        # === Информация ===
         info_frame = ttk.Frame(self)
         info_frame.pack(fill="x", padx=8, pady=(8, 4))
 
         status_text = {
-            "local_only": "📄 Только локально (нет в репозитории)",
-            "remote_only": "☁️ Только в репозитории (нет локально)",
+            "local_only": "📄 Только локально",
+            "remote_only": "☁️ Только в репозитории",
             "changed": "⚡ Изменён с обеих сторон",
         }.get(local_status, local_status)
 
         ttk.Label(
-            info_frame, text=f"📁 {file_path}", font=("Segoe UI", 10, "bold")
+            info_frame, text=f"📁 {file_path}",
+            font=("Segoe UI", 10, "bold"),
         ).pack(anchor="w")
         ttk.Label(info_frame, text=status_text, foreground="#555").pack(anchor="w")
 
@@ -592,84 +707,64 @@ class DiffWindow(tk.Toplevel):
         diff_container = ttk.PanedWindow(self, orient="horizontal")
         diff_container.pack(fill="both", expand=True, padx=8, pady=4)
 
-        # Левая панель — локальная версия
         left_frame = ttk.LabelFrame(diff_container, text="Локальная версия")
         diff_container.add(left_frame, weight=1)
-
         self.local_text = tk.Text(
             left_frame, wrap="none", font=("Consolas", 9),
-            bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
-            padx=4, pady=4,
+            bg="#1e1e1e", fg="#d4d4d4", padx=4, pady=4,
         )
-        left_scroll_y = ttk.Scrollbar(left_frame, orient="vertical",
-                                       command=self.local_text.yview)
-        left_scroll_x = ttk.Scrollbar(left_frame, orient="horizontal",
-                                       command=self.local_text.xview)
-        self.local_text.configure(
-            yscrollcommand=self._make_yscroll(self.local_text, "left"),
-            xscrollcommand=left_scroll_x.set,
-        )
-        left_scroll_y.pack(side="right", fill="y")
-        left_scroll_x.pack(side="bottom", fill="x")
+        lsy = ttk.Scrollbar(left_frame, orient="vertical",
+                             command=self.local_text.yview)
+        lsx = ttk.Scrollbar(left_frame, orient="horizontal",
+                             command=self.local_text.xview)
+        self.local_text.configure(yscrollcommand=lsy.set, xscrollcommand=lsx.set)
+        lsy.pack(side="right", fill="y")
+        lsx.pack(side="bottom", fill="x")
         self.local_text.pack(fill="both", expand=True)
 
-        # Правая панель — версия репозитория
         right_frame = ttk.LabelFrame(diff_container, text="Версия репозитория")
         diff_container.add(right_frame, weight=1)
-
         self.remote_text = tk.Text(
             right_frame, wrap="none", font=("Consolas", 9),
-            bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
-            padx=4, pady=4,
+            bg="#1e1e1e", fg="#d4d4d4", padx=4, pady=4,
         )
-        right_scroll_y = ttk.Scrollbar(right_frame, orient="vertical",
-                                        command=self.remote_text.yview)
-        right_scroll_x = ttk.Scrollbar(right_frame, orient="horizontal",
-                                        command=self.remote_text.xview)
-        self.remote_text.configure(
-            yscrollcommand=self._make_yscroll(self.remote_text, "right"),
-            xscrollcommand=right_scroll_x.set,
-        )
-        right_scroll_y.pack(side="right", fill="y")
-        right_scroll_x.pack(side="bottom", fill="x")
+        rsy = ttk.Scrollbar(right_frame, orient="vertical",
+                             command=self.remote_text.yview)
+        rsx = ttk.Scrollbar(right_frame, orient="horizontal",
+                             command=self.remote_text.xview)
+        self.remote_text.configure(yscrollcommand=rsy.set, xscrollcommand=rsx.set)
+        rsy.pack(side="right", fill="y")
+        rsx.pack(side="bottom", fill="x")
         self.remote_text.pack(fill="both", expand=True)
 
-        # Теги подсветки
         for widget in (self.local_text, self.remote_text):
-            widget.tag_configure(self.TAG_ADDED, background="#264f78", foreground="#d4d4d4")
-            widget.tag_configure(self.TAG_REMOVED, background="#5a1d1d", foreground="#d4d4d4")
-            widget.tag_configure(self.TAG_HEADER, background="#333", foreground="#569cd6")
+            widget.tag_configure(self.TAG_ADDED, background="#264f78",
+                                 foreground="#d4d4d4")
+            widget.tag_configure(self.TAG_REMOVED, background="#5a1d1d",
+                                 foreground="#d4d4d4")
 
-        # Заполняем тексты
         self._populate_texts(local_content, remote_content)
-
         self.local_text.configure(state="disabled")
         self.remote_text.configure(state="disabled")
 
-        # === Информация о мерже (для "changed") ===
-        self.merge_info_frame = ttk.Frame(self)
-        self.merge_info_frame.pack(fill="x", padx=8, pady=(0, 2))
-        self.merge_info_label = ttk.Label(self.merge_info_frame, text="",
-                                           foreground="#b06000", wraplength=860)
+        # === Мерж-инфо ===
+        self.merge_info_label = ttk.Label(self, text="", foreground="#b06000",
+                                           wraplength=860)
+        self.merge_info_label.pack(fill="x", padx=8, pady=(0, 2))
+
         if local_status == "changed" and local_content and remote_content:
             mr = merge_text_contents(local_content, remote_content, file_path)
             if mr.success:
                 self.merge_info_label.configure(
-                    text=f"✅ Мерж возможен: {mr.local_only_lines} строк локально, "
-                         f"{mr.remote_only_lines} строк из репо — без конфликтов",
+                    text=f"✅ Мерж возможен: +{mr.local_only_lines} локально, "
+                         f"+{mr.remote_only_lines} из репо",
                     foreground="#006600",
                 )
             else:
-                conflict_text = "; ".join(mr.conflicts) if mr.conflicts else "обнаружены"
                 self.merge_info_label.configure(
-                    text=f"⚠ Конфликт: {conflict_text}. "
-                         f"Можно сохранить обе версии (.local) или выбрать одну сторону.",
+                    text=f"⚠ Конфликт: {'; '.join(mr.conflicts)}",
                     foreground="#cc0000",
                 )
-            self.merge_info_label.pack(anchor="w")
-            self._merge_result = mr
-        else:
-            self._merge_result = None
 
         # === Кнопки ===
         btn_frame = ttk.Frame(self)
@@ -685,27 +780,19 @@ class DiffWindow(tk.Toplevel):
             command=lambda: self._apply("remote_to_local"),
         ).pack(side="left", padx=4)
 
-        # Кнопка мержа (только при "changed")
         if local_status == "changed":
             ttk.Button(
                 btn_frame, text="🔀 Слить обе версии",
                 command=lambda: self._apply("merge"),
             ).pack(side="left", padx=4)
 
-            ttk.Button(
-                btn_frame, text="💾 Сохранить обе (.local)",
-                command=lambda: self._apply("save_both"),
-            ).pack(side="left", padx=4)
-
         ttk.Button(
             btn_frame, text="Закрыть", command=self.destroy,
         ).pack(side="right", padx=4)
 
-        # Синхронизация горизонтальной прокрутки
         self._syncing_scroll = False
 
     def _make_yscroll(self, source_widget, side):
-        """Создаёт функцию прокрутки с синхронизацией."""
         def on_scroll(*args):
             if self._syncing_scroll:
                 return
@@ -717,46 +804,35 @@ class DiffWindow(tk.Toplevel):
         return on_scroll
 
     def _populate_texts(self, local_content, remote_content):
-        """Заполняет текстовые панели и подсвечивает различия."""
         local_bin = local_content or b""
         remote_bin = remote_content or b""
 
-        # Проверяем на бинарность
         if is_binary(local_bin) or is_binary(remote_bin):
             self.local_text.insert("1.0",
-                "(Локально) Бинарный файл — текстовое сравнение недоступно\n"
-                f"Размер: {len(local_bin)} байт")
+                f"(Локально) Бинарный файл — {len(local_bin)} байт")
             self.remote_text.insert("1.0",
-                "(Репозиторий) Бинарный файл — текстовое сравнение недоступно\n"
-                f"Размер: {len(remote_bin)} байт")
+                f"(Репозиторий) Бинарный файл — {len(remote_bin)} байт")
             return
 
         local_lines = local_bin.decode("utf-8", errors="replace").splitlines()
         remote_lines = remote_bin.decode("utf-8", errors="replace").splitlines()
 
-        # Пустые файлы
         if not local_lines and not remote_lines:
             self.local_text.insert("1.0", "(пустой файл)")
             self.remote_text.insert("1.0", "(пустой файл)")
             return
-
         if not local_lines:
             self.local_text.insert("1.0", "(файл отсутствует локально)")
             self._fill_panel(self.remote_text, remote_lines, [])
             return
-
         if not remote_lines:
             self._fill_panel(self.local_text, local_lines, [])
             self.remote_text.insert("1.0", "(файл отсутствует в репозитории)")
             return
 
-        # Вычисляем diff через SequenceMatcher
         matcher = difflib.SequenceMatcher(None, remote_lines, local_lines)
-
-        local_out = []
-        remote_out = []
-        local_tags = []  # (line_no_1based, tag_name)
-        remote_tags = []
+        local_out, remote_out = [], []
+        local_tags, remote_tags = [], []
 
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == "equal":
@@ -765,30 +841,25 @@ class DiffWindow(tk.Toplevel):
                     remote_out.append(line)
                     local_out.append(line)
             elif tag == "replace":
-                # Удалённые строки (были в remote, заменены в local)
                 for k in range(i1, i2):
                     remote_out.append(remote_lines[k])
                     remote_tags.append((len(remote_out), self.TAG_REMOVED))
-                # Новые строки (в local)
                 for k in range(j1, j2):
                     local_out.append(local_lines[k])
                     local_tags.append((len(local_out), self.TAG_ADDED))
-                # Выравниваем панели пустыми строками
-                remote_missing = (j2 - j1) - (i2 - i1)
-                if remote_missing > 0:
-                    for _ in range(remote_missing):
+                diff = (j2 - j1) - (i2 - i1)
+                if diff > 0:
+                    for _ in range(diff):
                         remote_out.append("")
-                elif remote_missing < 0:
-                    for _ in range(-remote_missing):
+                elif diff < 0:
+                    for _ in range(-diff):
                         local_out.append("")
             elif tag == "delete":
-                # Строки есть в remote, но нет в local
                 for k in range(i1, i2):
                     remote_out.append(remote_lines[k])
                     remote_tags.append((len(remote_out), self.TAG_REMOVED))
                     local_out.append("")
             elif tag == "insert":
-                # Строки есть в local, но нет в remote
                 for k in range(j1, j2):
                     local_out.append(local_lines[k])
                     local_tags.append((len(local_out), self.TAG_ADDED))
@@ -799,7 +870,6 @@ class DiffWindow(tk.Toplevel):
 
     @staticmethod
     def _fill_panel(text_widget, lines, tags):
-        """Заполняет текстовый виджет строками и применяет теги."""
         content = "\n".join(lines)
         text_widget.insert("1.0", content)
         for line_no, tag_name in tags:
@@ -815,8 +885,6 @@ class DiffWindow(tk.Toplevel):
 # ============================================================
 
 class MainApp(tk.Tk):
-    """Главное окно приложения GitMergeMods."""
-
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
@@ -838,63 +906,48 @@ class MainApp(tk.Tk):
         self._create_ui()
         self._load_config_to_ui()
 
-    # ---- Тема ----
-
     def _setup_theme(self):
         style = ttk.Style(self)
-        available = style.theme_names()
         for theme in ("vista", "winnative", "clam"):
-            if theme in available:
+            if theme in style.theme_names():
                 style.theme_use(theme)
                 break
 
-    # ---- Создание UI ----
-
     def _create_ui(self):
-        # === Панель настроек ===
+        # === Настройки ===
         settings = ttk.LabelFrame(self, text=" Подключение ", padding=6)
         settings.pack(fill="x", padx=8, pady=(8, 4))
         settings.columnconfigure(1, weight=1)
 
-        # Токен
         ttk.Label(settings, text="🔑 Токен GitHub:").grid(
-            row=0, column=0, sticky="w", padx=2, pady=2
-        )
+            row=0, column=0, sticky="w", padx=2, pady=2)
         self.token_var = tk.StringVar()
-        self.token_entry = ttk.Entry(settings, textvariable=self.token_var, width=65, show="•")
-        self.token_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Entry(settings, textvariable=self.token_var, width=65,
+                   show="•").grid(row=0, column=1, columnspan=2,
+                                  sticky="ew", padx=2, pady=2)
 
-        # Репозиторий
         ttk.Label(settings, text="📦 Репозиторий:").grid(
-            row=1, column=0, sticky="w", padx=2, pady=2
-        )
+            row=1, column=0, sticky="w", padx=2, pady=2)
         self.repo_var = tk.StringVar()
         ttk.Entry(settings, textvariable=self.repo_var, width=65).grid(
-            row=1, column=1, columnspan=2, sticky="ew", padx=2, pady=2
-        )
+            row=1, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
 
-        # Локальная папка
         ttk.Label(settings, text="📁 Папка модов:").grid(
-            row=2, column=0, sticky="w", padx=2, pady=2
-        )
+            row=2, column=0, sticky="w", padx=2, pady=2)
         self.folder_var = tk.StringVar()
         ttk.Entry(settings, textvariable=self.folder_var, width=55).grid(
-            row=2, column=1, sticky="ew", padx=2, pady=2
-        )
-        ttk.Button(settings, text="📂 Обзор", width=8, command=self._browse_folder).grid(
-            row=2, column=2, padx=2, pady=2
-        )
+            row=2, column=1, sticky="ew", padx=2, pady=2)
+        ttk.Button(settings, text="📂 Обзор", width=8,
+                    command=self._browse_folder).grid(
+            row=2, column=2, padx=2, pady=2)
 
-        # Ветка
         ttk.Label(settings, text="🌿 Ветка:").grid(
-            row=3, column=0, sticky="w", padx=2, pady=2
-        )
+            row=3, column=0, sticky="w", padx=2, pady=2)
         self.branch_var = tk.StringVar(value="main")
         ttk.Entry(settings, textvariable=self.branch_var, width=25).grid(
-            row=3, column=1, sticky="w", padx=2, pady=2
-        )
+            row=3, column=1, sticky="w", padx=2, pady=2)
 
-        # === Панель управления ===
+        # === Управление ===
         ctrl = ttk.Frame(self)
         ctrl.pack(fill="x", padx=8, pady=4)
 
@@ -903,11 +956,13 @@ class MainApp(tk.Tk):
         self.connect_btn.pack(side="left", padx=4)
 
         self.sync_btn = ttk.Button(ctrl, text="🔄 Загрузить всё из репо",
-                                    width=24, command=self._download_all, state="disabled")
+                                    width=24, command=self._download_all,
+                                    state="disabled")
         self.sync_btn.pack(side="left", padx=4)
 
-        self.upload_all_btn = ttk.Button(ctrl, text="📤 Отправить всё в репо",
-                                          width=24, command=self._upload_all, state="disabled")
+        self.upload_all_btn = ttk.Button(
+            ctrl, text="📤 Отправить всё в репо",
+            width=24, command=self._upload_all, state="disabled")
         self.upload_all_btn.pack(side="left", padx=4)
 
         # Режимы
@@ -915,23 +970,25 @@ class MainApp(tk.Tk):
         modes.pack(fill="x", padx=8, pady=2)
 
         self.auto_push_var = tk.BooleanVar()
-        ttk.Checkbutton(modes, text="🔄 Авто-пуш (автоматическая синхронизация)",
-                         variable=self.auto_push_var,
-                         command=self._on_auto_push_toggle).pack(side="left", padx=8)
+        ttk.Checkbutton(
+            modes, text="🔄 Авто-пуш (автоматическая синхронизация)",
+            variable=self.auto_push_var,
+            command=self._on_auto_push_toggle).pack(side="left", padx=8)
 
         self.filter_var = tk.BooleanVar()
-        ttk.Checkbutton(modes, text="📋 Только .xml / .txt",
-                         variable=self.filter_var,
-                         command=self._on_filter_toggle).pack(side="left", padx=8)
+        ttk.Checkbutton(
+            modes, text="📋 Только .xml / .txt",
+            variable=self.filter_var,
+            command=self._on_filter_toggle).pack(side="left", padx=8)
 
         # === Список изменений ===
-        list_frame = ttk.LabelFrame(self, text=" Изменённые файлы (двойной клик → diff) ", padding=4)
+        list_frame = ttk.LabelFrame(
+            self, text=" Изменённые файлы (двойной клик → diff) ", padding=4)
         list_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         columns = ("path", "status", "direction")
         self.tree = ttk.Treeview(
-            list_frame, columns=columns, show="headings", selectmode="browse"
-        )
+            list_frame, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("path", text="Файл")
         self.tree.heading("status", text="Статус")
         self.tree.heading("direction", text="Направление")
@@ -939,26 +996,25 @@ class MainApp(tk.Tk):
         self.tree.column("status", width=130, minwidth=80)
         self.tree.column("direction", width=170, minwidth=100)
 
-        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical",
+                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-
         self.tree.bind("<Double-1>", self._on_double_click)
 
-        # Теги раскраски
         self.tree.tag_configure("local_only", background="#d4edda")
         self.tree.tag_configure("remote_only", background="#cce5ff")
         self.tree.tag_configure("changed", background="#f8d7da")
+        self.tree.tag_configure("conflict", background="#ff4444",
+                                 foreground="white")
 
         # === Статус-бар ===
         self.status_var = tk.StringVar(
-            value="Отключено. Укажите настройки и нажмите «Подключить»."
-        )
-        status_bar = ttk.Label(self, textvariable=self.status_var,
-                                relief="sunken", anchor="w", padding=4)
-        status_bar.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
+            value="Отключено. Укажите настройки и нажмите «Подключить».")
+        ttk.Label(self, textvariable=self.status_var,
+                   relief="sunken", anchor="w", padding=4).pack(
+            fill="x", side="bottom", padx=8, pady=(0, 8))
 
     # ---- Конфигурация UI ----
 
@@ -1000,7 +1056,7 @@ class MainApp(tk.Tk):
         branch = self.config.branch
 
         if not token:
-            messagebox.showerror("Ошибка", "Укажите токен GitHub (с правами repo).")
+            messagebox.showerror("Ошибка", "Укажите токен GitHub.")
             return
         if not repo_url:
             messagebox.showerror("Ошибка", "Укажите URL репозитория.")
@@ -1016,27 +1072,26 @@ class MainApp(tk.Tk):
             try:
                 client = GitHubClient(token, repo_url, branch)
                 repo_info = client.test_connection()
-
                 if not repo_info:
                     self.after(0, lambda: messagebox.showerror(
-                        "Ошибка", "Не удалось подключиться. Проверьте токен и URL."
-                    ))
-                    self.after(0, lambda: self.status_var.set("Ошибка подключения"))
+                        "Ошибка", "Не удалось подключиться."))
+                    self.after(0, lambda: self.status_var.set(
+                        "Ошибка подключения"))
                     return
 
                 self.github = client
                 if not os.path.isdir(folder):
                     os.makedirs(folder, exist_ok=True)
 
-                exts = self.config.extensions if self.config.filter_extensions else None
+                exts = (self.config.extensions
+                        if self.config.filter_extensions else None)
                 self.scanner = FileScanner(folder, exts)
-
                 self.connected = True
                 repo_name = repo_info.get("full_name", "?")
                 self.after(0, lambda: self._on_connected(repo_name, branch))
-
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Ошибка подключения", str(e)))
+                self.after(0, lambda: messagebox.showerror(
+                    "Ошибка подключения", str(e)))
                 self.after(0, lambda: self.status_var.set(f"Ошибка: {e}"))
 
         threading.Thread(target=connect_worker, daemon=True).start()
@@ -1069,21 +1124,23 @@ class MainApp(tk.Tk):
     def _do_scan(self):
         if not self.connected or self.scanning:
             if self.connected:
-                self._scan_after_id = self.after(SCAN_INTERVAL_SEC * 1000, self._do_scan)
+                self._scan_after_id = self.after(
+                    SCAN_INTERVAL_SEC * 1000, self._do_scan)
             return
 
         self.scanning = True
 
         def scan_worker():
             try:
-                # Обновляем фильтр расширений
                 if self.scanner:
                     self.scanner.extensions_filter = (
-                        self.config.extensions if self.filter_var.get() else None
-                    )
+                        self.config.extensions
+                        if self.filter_var.get() else None)
 
-                local_files = self.scanner.scan_local() if self.scanner else {}
-                remote_tree, commit_sha = self.github.get_tree() if self.github else ({}, None)
+                local_files = (self.scanner.scan_local()
+                               if self.scanner else {})
+                remote_tree, commit_sha = (
+                    self.github.get_tree() if self.github else ({}, None))
                 changes = FileScanner.compare(local_files, remote_tree)
 
                 with self._lock:
@@ -1093,24 +1150,21 @@ class MainApp(tk.Tk):
 
                 self.after(0, self._update_changes_list)
 
-                # Авто-пуш
                 if self.auto_push_var.get() and changes:
                     self.after(100, self._auto_push_changes)
 
             except Exception as e:
-                self.after(0, lambda: self.status_var.set(f"⚠ Ошибка сканирования: {e}"))
+                self.after(0, lambda: self.status_var.set(
+                    f"⚠ Ошибка сканирования: {e}"))
             finally:
                 self.scanning = False
                 if self.connected:
                     self._scan_after_id = self.after(
-                        SCAN_INTERVAL_SEC * 1000, self._do_scan
-                    )
+                        SCAN_INTERVAL_SEC * 1000, self._do_scan)
 
         threading.Thread(target=scan_worker, daemon=True).start()
 
     def _update_changes_list(self):
-        """Обновляет список файлов в UI."""
-        # Запоминаем выделение
         sel = self.tree.selection()
         sel_path = None
         if sel:
@@ -1131,15 +1185,17 @@ class MainApp(tk.Tk):
         DIR_TEXT = {
             "local_only": "локальн. → репо",
             "remote_only": "репо → локальн.",
-            "changed": "отличие (×2)",
+            "changed": "проверка мержа...",
         }
 
         for c in changes:
             path = c["path"]
             status = STATUS_TEXT.get(c["status"], c["status"])
             direction = DIR_TEXT.get(c["status"], "—")
-            iid = self.tree.insert("", "end", values=(path, status, direction),
-                                    tags=(c["status"],))
+            tag = c["status"]
+            iid = self.tree.insert("", "end",
+                                    values=(path, status, direction),
+                                    tags=(tag,))
             if path == sel_path:
                 self.tree.selection_set(iid)
 
@@ -1147,12 +1203,10 @@ class MainApp(tk.Tk):
         with self._lock:
             total_local = len(self.local_files)
             n_changes = len(self.changes)
-        synced = total_local - n_changes
-        if synced < 0:
-            synced = 0
+        synced = max(0, total_local - n_changes)
         self.status_var.set(
-            f"✅ Синхронизировано: {synced} | Изменений: {n_changes} | Проверка: {now}"
-        )
+            f"✅ Синхронизировано: {synced} | "
+            f"Изменений: {n_changes} | Проверка: {now}")
 
     # ---- Двойной клик → Diff ----
 
@@ -1163,8 +1217,7 @@ class MainApp(tk.Tk):
         vals = self.tree.item(sel[0], "values")
         if not vals:
             return
-        file_path = vals[0]
-        self._show_diff(str(file_path))
+        self._show_diff(str(vals[0]))
 
     def _show_diff(self, file_path):
         with self._lock:
@@ -1174,7 +1227,6 @@ class MainApp(tk.Tk):
         if not local_info and not remote_info:
             return
 
-        # Локальное содержимое
         local_content = None
         if local_info:
             try:
@@ -1191,7 +1243,8 @@ class MainApp(tk.Tk):
                 remote_content = None
                 remote_sha = None
                 if remote_info:
-                    remote_content, remote_sha = self.github.get_file_content(file_path)
+                    remote_content, remote_sha = (
+                        self.github.get_file_content(file_path))
 
                 status = "changed"
                 if local_info and not remote_info:
@@ -1200,154 +1253,108 @@ class MainApp(tk.Tk):
                     status = "remote_only"
 
                 self.after(0, lambda: self._open_diff_window(
-                    file_path, local_content, remote_content, remote_sha, status
-                ))
+                    file_path, local_content, remote_content,
+                    remote_sha, status))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+                self.after(0, lambda: messagebox.showerror(
+                    "Ошибка", str(e)))
 
         threading.Thread(target=fetch_and_show, daemon=True).start()
 
     def _open_diff_window(self, file_path, local_content, remote_content,
                            remote_sha, status):
-        with self._lock:
-            local_info = self.local_files.get(file_path)
-            local_hash = local_info["hash"] if local_info else None
-
         def on_apply(direction):
             self._apply_single_change(
                 file_path, direction, local_content, remote_content,
-                local_hash, remote_sha
-            )
-
-        DiffWindow(self, file_path, local_content, remote_content, status, on_apply)
+                remote_sha)
+        DiffWindow(self, file_path, local_content, remote_content,
+                   status, on_apply)
 
     def _apply_single_change(self, file_path, direction, local_content,
-                              remote_content, local_hash, remote_sha):
-        """Применяет одно изменение с поддержкой мержа."""
+                              remote_content, remote_sha):
+        """Ручное применение одного изменения из DiffWindow."""
         try:
+            local_path = os.path.join(
+                self.config.local_folder,
+                file_path.replace("/", os.sep))
+
             if direction == "local_to_remote":
                 if local_content is None:
-                    messagebox.showwarning("Внимание", "Нет локального содержимого.")
+                    messagebox.showwarning("Внимание",
+                                           "Нет локального содержимого.")
                     return
                 self.status_var.set(f"Отправка {file_path} → репозиторий...")
                 self.update_idletasks()
-                # Сначала скачиваем актуальную remote версию
-                fresh_remote, fresh_sha = self.github.get_file_content(file_path)
+
+                # Проверяем свежий remote
+                fresh_remote, fresh_sha = (
+                    self.github.get_file_content(file_path))
                 if fresh_remote and fresh_sha and fresh_sha != remote_sha:
-                    # Remote изменился с момента открытия diff — пробуем мерж
-                    mr = merge_text_contents(local_content, fresh_remote, file_path)
+                    mr = merge_text_contents(
+                        local_content, fresh_remote, file_path)
                     if mr.success:
-                        self.github.upload_file(file_path, mr.content,
-                                                 existing_sha=fresh_sha)
-                        # Сохраняем мерж локально тоже
-                        local_path = os.path.join(
-                            self.config.local_folder,
-                            file_path.replace("/", os.sep),
-                        )
+                        self.github.upload_file(
+                            file_path, mr.content, existing_sha=fresh_sha)
                         os.makedirs(os.path.dirname(local_path), exist_ok=True)
                         with open(local_path, "wb") as f:
                             f.write(mr.content)
                         self.status_var.set(
-                            f"✅ {file_path} — смержено и отправлено (remote успел обновиться)"
-                        )
+                            f"✅ {file_path} — смержено и отправлено")
                     else:
                         messagebox.showwarning(
-                            "Конфликт при отправке",
-                            f"Файл {file_path} был изменён в репозитории "
-                            f"пока вы просматривали diff.\n\n"
-                            f"Автоматический мерж невозможен: {'; '.join(mr.conflicts)}\n\n"
-                            f"Закройте это окно и откройте diff заново.",
-                        )
+                            "Конфликт",
+                            f"Remote изменился. Мерж невозможен:\n"
+                            f"{'; '.join(mr.conflicts)}\n\n"
+                            f"Откройте diff заново.")
                         self.status_var.set(f"⚠ Конфликт: {file_path}")
                         return
                 else:
-                    self.github.upload_file(file_path, local_content,
-                                             existing_sha=remote_sha)
-                    self.status_var.set(f"✅ {file_path} отправлен в репозиторий")
+                    self.github.upload_file(
+                        file_path, local_content, existing_sha=remote_sha)
+                    self.status_var.set(
+                        f"✅ {file_path} отправлен в репозиторий")
 
             elif direction == "remote_to_local":
                 if remote_content is None:
-                    messagebox.showwarning("Внимание", "Нет содержимого репозитория.")
+                    messagebox.showwarning("Внимание",
+                                           "Нет содержимого репозитория.")
                     return
-                self.status_var.set(f"Загрузка {file_path} → локально...")
-                self.update_idletasks()
-                local_path = os.path.join(
-                    self.config.local_folder, file_path.replace("/", os.sep)
-                )
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 with open(local_path, "wb") as f:
                     f.write(remote_content)
                 self.status_var.set(f"✅ {file_path} загружен локально")
 
             elif direction == "merge":
-                # Сливаем обе версии
                 if local_content is None or remote_content is None:
-                    messagebox.showwarning(
-                        "Внимание",
-                        "Для мержа нужны обе версии файла (локальная и удалённая).",
-                    )
+                    messagebox.showwarning("Внимание", "Нужны обе версии.")
                     return
-                mr = merge_text_contents(local_content, remote_content, file_path)
+                mr = merge_text_contents(
+                    local_content, remote_content, file_path)
                 if mr.success:
-                    # Чистый мерж — записываем локально и отправляем в репо
-                    local_path = os.path.join(
-                        self.config.local_folder,
-                        file_path.replace("/", os.sep),
-                    )
                     os.makedirs(os.path.dirname(local_path), exist_ok=True)
                     with open(local_path, "wb") as f:
                         f.write(mr.content)
-                    self.github.upload_file(file_path, mr.content,
-                                             existing_sha=remote_sha)
+                    self.github.upload_file(
+                        file_path, mr.content, existing_sha=remote_sha)
                     self.status_var.set(
                         f"✅ {file_path} — смержено "
                         f"(+{mr.local_only_lines} локально, "
-                        f"+{mr.remote_only_lines} из репо)"
-                    )
+                        f"+{mr.remote_only_lines} из репо)")
                 else:
-                    # Конфликт — предлагаем сохранить с маркерами
-                    result = messagebox.askyesno(
+                    messagebox.showwarning(
                         "Конфликт мержа",
-                        f"Автоматический мерж невозможен для {file_path}:\n"
-                        f"{'; '.join(mr.conflicts)}\n\n"
-                        f"Сохранить файл с маркерами конфликта "
-                        f"(<<<<<<< / >>>>>>>) локально?\n"
-                        f"Также будет создана копия .local с вашей версией.",
-                    )
-                    if result:
-                        local_path = os.path.join(
-                            self.config.local_folder,
-                            file_path.replace("/", os.sep),
-                        )
-                        backup_path = save_conflict_files(
-                            self.config.local_folder, file_path,
-                            local_content, mr.content,
-                        )
-                        self.status_var.set(
-                            f"⚠ {file_path} — конфликт сохранён в {backup_path}"
-                        )
+                        f"Мерж невозможен:\n{'; '.join(mr.conflicts)}")
                     return
-
-            elif direction == "save_both":
-                # Сохраняем обе версии: remote как основной, local как .local
-                if local_content is None or remote_content is None:
-                    messagebox.showwarning("Внимание", "Нужны обе версии файла.")
-                    return
-                backup_path = save_conflict_files(
-                    self.config.local_folder, file_path,
-                    local_content, remote_content,
-                )
-                self.status_var.set(
-                    f"💾 {file_path}: remote → основная, local → {os.path.basename(backup_path)}"
-                )
 
             self.after(1000, self._do_scan)
 
         except Exception as e:
-            messagebox.showerror("Ошибка применения", str(e))
+            messagebox.showerror("Ошибка", str(e))
             self.status_var.set(f"⚠ Ошибка: {e}")
 
-    # ---- Авто-пуш ----
+    # ================================================================
+    # АВТО-ПУШ: batch-мерж + конфликт-диалог
+    # ================================================================
 
     def _auto_push_changes(self):
         with self._lock:
@@ -1356,9 +1363,15 @@ class MainApp(tk.Tk):
         if not changes:
             return
 
-        self.status_var.set(f"🔄 Авто-пуш: обработка {len(changes)} изменений...")
+        self.status_var.set(
+            f"🔄 Авто-синхронизация: {len(changes)} изменений...")
 
         def auto_worker():
+            files_to_upload = {}   # path → merged/content bytes
+            files_to_download = {} # path → (remote_content, remote_sha)
+            conflict_list = []     # (path, local_content, remote_content, sha)
+            errors = []
+
             for change in changes:
                 if not self.connected:
                     break
@@ -1367,78 +1380,194 @@ class MainApp(tk.Tk):
                     status = change["status"]
 
                     if status == "local_only":
-                        # Локальный файл → отправить в репо
                         full_path = change.get("full_path") or os.path.join(
-                            self.config.local_folder, path.replace("/", os.sep)
-                        )
+                            self.config.local_folder,
+                            path.replace("/", os.sep))
                         if os.path.isfile(full_path):
                             with open(full_path, "rb") as f:
-                                content = f.read()
-                            self.github.upload_file(path, content)
-                    elif status == "remote_only":
-                        # Удалённый файл → скачать локально
-                        remote_content, _ = self.github.get_file_content(path)
-                        if remote_content:
-                            local_path = os.path.join(
-                                self.config.local_folder, path.replace("/", os.sep)
-                            )
-                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                            with open(local_path, "wb") as f:
-                                f.write(remote_content)
-                    elif status == "changed":
-                        # Конфликт — пытаемся смержить
-                        full_path = change.get("full_path") or os.path.join(
-                            self.config.local_folder, path.replace("/", os.sep)
-                        )
-                        local_path = os.path.join(
-                            self.config.local_folder, path.replace("/", os.sep)
-                        )
+                                files_to_upload[path] = f.read()
 
+                    elif status == "remote_only":
+                        remote_content, remote_sha = (
+                            self.github.get_file_content(path))
+                        if remote_content:
+                            files_to_download[path] = (
+                                remote_content, remote_sha)
+
+                    elif status == "changed":
+                        # Читаем локальный файл
+                        local_path = os.path.join(
+                            self.config.local_folder,
+                            path.replace("/", os.sep))
+                        local_bytes = b""
                         if os.path.isfile(local_path):
                             with open(local_path, "rb") as f:
                                 local_bytes = f.read()
-                        else:
-                            local_bytes = b""
 
-                        remote_content, remote_sha = self.github.get_file_content(path)
+                        # Скачиваем remote
+                        remote_content, remote_sha = (
+                            self.github.get_file_content(path))
                         if remote_content is None:
                             continue
 
-                        mr = merge_text_contents(local_bytes, remote_content, path)
+                        # Пробуем мерж
+                        mr = merge_text_contents(
+                            local_bytes, remote_content, path)
 
                         if mr.success:
-                            # Чистый мерж — записываем обе стороны
-                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                            with open(local_path, "wb") as f:
-                                f.write(mr.content)
-                            self.github.upload_file(
-                                path, mr.content, existing_sha=remote_sha
-                            )
+                            # Чистый мерж → в batch-коммит
+                            files_to_upload[path] = mr.content
                         else:
-                            # Конфликт — remote локально + .local копия
-                            save_conflict_files(
-                                self.config.local_folder, path,
-                                local_bytes, remote_content,
-                            )
-                            print(
-                                f"Auto-push CONFLICT [{path}]: "
-                                f"{'; '.join(mr.conflicts)} — "
-                                f"сохранены обе версии (.local)"
-                            )
+                            # Конфликт → отдаём пользователю
+                            conflict_list.append((
+                                path, local_bytes, remote_content, remote_sha
+                            ))
 
                 except Exception as e:
-                    print(f"Auto-push error [{path}]: {e}")
+                    errors.append(f"{path}: {e}")
 
-            self.after(0, lambda: self.status_var.set("✅ Авто-пуш завершён"))
-            # Пересканируем через секунду
-            self.after(2000, self._do_scan)
+            # === 1. Batch-коммит для неконфликтных файлов ===
+            batch_ok = False
+            if files_to_upload:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                n_files = len(files_to_upload)
+                message = (f"Auto-sync: {n_files} файл(ов) "
+                           f"обновлено [{ts}]")
+
+                # Сначала пушим в репо единым коммитом
+                try:
+                    ok, commit_sha = self.github.batch_commit(
+                        files_to_upload, message=message)
+                    if ok:
+                        batch_ok = True
+                        # Теперь заменяем локальные файлы на
+                        # версию из репо (repo = source of truth)
+                        for path, content in files_to_upload.items():
+                            local_path = os.path.join(
+                                self.config.local_folder,
+                                path.replace("/", os.sep))
+                            os.makedirs(os.path.dirname(local_path),
+                                        exist_ok=True)
+                            with open(local_path, "wb") as f:
+                                f.write(content)
+                except Exception as e:
+                    errors.append(f"Batch commit: {e}")
+
+            # === 2. Скачиваем remote_only файлы ===
+            for path, (content, sha) in files_to_download.items():
+                try:
+                    local_path = os.path.join(
+                        self.config.local_folder,
+                        path.replace("/", os.sep))
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "wb") as f:
+                        f.write(content)
+                except Exception as e:
+                    errors.append(f"Download {path}: {e}")
+
+            # === 3. Конфликты → показываем пользователю ===
+            n_conflicts = len(conflict_list)
+            if conflict_list:
+                self.after(0, lambda: self._show_conflicts(conflict_list))
+            else:
+                n_batch = len(files_to_upload)
+                n_dl = len(files_to_download)
+                msg = "✅ Синхронизация завершена"
+                if n_batch:
+                    msg += f" | Коммит: {n_batch} файл(ов)"
+                if n_dl:
+                    msg += f" | Скачано: {n_dl} файл(ов)"
+                if errors:
+                    msg += f" | Ошибок: {len(errors)}"
+                final_msg = msg
+                self.after(0, lambda: self.status_var.set(final_msg))
+
+            if not conflict_list:
+                self.after(2000, self._do_scan)
 
         threading.Thread(target=auto_worker, daemon=True).start()
+
+    def _show_conflicts(self, conflict_list):
+        """Показывает конфликты по одному, каждый — отдельный коммит."""
+        self._conflict_queue = list(conflict_list)
+        self._process_next_conflict()
+
+    def _process_next_conflict(self):
+        if not self._conflict_queue:
+            self.status_var.set(
+                "✅ Все конфликты разрешены. Сканирование...")
+            self.after(2000, self._do_scan)
+            return
+
+        item = self._conflict_queue.pop(0)
+        path, local_content, remote_content, remote_sha = item
+
+        def on_resolve(action):
+            self._handle_conflict_action(
+                path, action, local_content, remote_content, remote_sha)
+
+        ConflictDialog(
+            self, path, local_content, remote_content, remote_sha,
+            on_resolve)
+
+    def _handle_conflict_action(self, path, action, local_content,
+                                 remote_content, remote_sha):
+        """Обрабатывает решение пользователя по конфликту."""
+        local_path = os.path.join(
+            self.config.local_folder, path.replace("/", os.sep))
+
+        try:
+            if action == "push_local":
+                # Пользователь хочет отправить свою версию в репо
+                self.status_var.set(
+                    f"Отправка {path} → репозиторий (отдельный коммит)...")
+                self.update_idletasks()
+
+                # Пробуем batch из одного файла для отдельного коммита
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ok, _ = self.github.batch_commit(
+                    {path: local_content},
+                    message=f"Conflict resolved (local): {path} [{ts}]")
+                if ok:
+                    # Обновляем локальный файл (repo = source of truth)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "wb") as f:
+                        f.write(local_content)
+                    self.status_var.set(
+                        f"✅ {path} — ваша версия отправлена в репо")
+                else:
+                    self.status_var.set(
+                        f"⚠ Не удалось отправить {path}")
+
+            elif action == "pull_remote":
+                # Пользователь принимает remote версию, теряет локальные
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, "wb") as f:
+                    f.write(remote_content)
+                self.status_var.set(
+                    f"✅ {path} — загружена версия из репозитория "
+                    f"(ваши изменения потеряны)")
+
+            elif action == "save_both":
+                backup_path = save_conflict_files(
+                    self.config.local_folder, path,
+                    local_content, remote_content)
+                self.status_var.set(
+                    f"💾 {path}: репо → основной, ваш → "
+                    f"{os.path.basename(backup_path)}")
+
+            elif action == "skip":
+                self.status_var.set(f"⏭ {path} — пропущен")
+
+        except Exception as e:
+            self.status_var.set(f"⚠ Ошибка для {path}: {e}")
+
+        # Следующий конфликт
+        self.after(500, self._process_next_conflict)
 
     # ---- Полная синхронизация ----
 
     def _download_all(self):
-        """Загружает все файлы из репозитория в локальную папку."""
         if not self.connected or not self.github:
             return
 
@@ -1450,45 +1579,43 @@ class MainApp(tk.Tk):
                 remote_tree, _ = self.github.get_tree()
                 count = 0
                 for path, info in remote_tree.items():
-                    # Фильтр расширений
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
                         if ext not in self.config.extensions:
                             continue
 
                     local_path = os.path.join(
-                        self.config.local_folder, path.replace("/", os.sep)
-                    )
+                        self.config.local_folder,
+                        path.replace("/", os.sep))
 
-                    # Проверяем, нужно ли скачивать
                     need_download = False
                     if not os.path.exists(local_path):
                         need_download = True
                     else:
                         with open(local_path, "rb") as f:
-                            local_hash = compute_git_blob_hash(f.read())
-                        if local_hash != info["sha"]:
-                            need_download = True
+                            if compute_git_blob_hash(f.read()) != info["sha"]:
+                                need_download = True
 
                     if need_download:
                         content, _ = self.github.get_file_content(path)
                         if content:
-                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                            os.makedirs(os.path.dirname(local_path),
+                                        exist_ok=True)
                             with open(local_path, "wb") as f:
                                 f.write(content)
                             count += 1
 
-                msg = f"✅ Загружено {count} файлов"
-                self.after(0, lambda: self.status_var.set(msg))
+                self.after(0, lambda: self.status_var.set(
+                    f"✅ Загружено {count} файлов"))
                 self.after(1000, self._do_scan)
 
             except Exception as e:
-                self.after(0, lambda: self.status_var.set(f"⚠ Ошибка загрузки: {e}"))
+                self.after(0, lambda: self.status_var.set(
+                    f"⚠ Ошибка загрузки: {e}"))
 
         threading.Thread(target=download_worker, daemon=True).start()
 
     def _upload_all(self):
-        """Отправляет все локальные файлы в репозиторий."""
         if not self.connected or not self.github:
             return
 
@@ -1501,30 +1628,42 @@ class MainApp(tk.Tk):
                     local_files = dict(self.local_files)
                     remote_tree = dict(self.remote_tree)
 
-                count = 0
+                files_to_upload = {}
                 for path, info in local_files.items():
-                    # Фильтр расширений
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
                         if ext not in self.config.extensions:
                             continue
 
-                    with open(info["full_path"], "rb") as f:
-                        content = f.read()
-
                     remote_sha = remote_tree.get(path, {}).get("sha")
                     if remote_sha and info["hash"] == remote_sha:
-                        continue  # Уже синхронизирован
+                        continue
 
-                    self.github.upload_file(path, content, existing_sha=remote_sha)
-                    count += 1
+                    with open(info["full_path"], "rb") as f:
+                        files_to_upload[path] = f.read()
 
-                msg = f"✅ Отправлено {count} файлов"
-                self.after(0, lambda: self.status_var.set(msg))
+                if files_to_upload:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ok, _ = self.github.batch_commit(
+                        files_to_upload,
+                        message=(f"Upload all: {len(files_to_upload)} "
+                                 f"файл(ов) [{ts}]"))
+                    if ok:
+                        self.after(0, lambda: self.status_var.set(
+                            f"✅ Отправлено {len(files_to_upload)} файлов "
+                            f"(один коммит)"))
+                    else:
+                        self.after(0, lambda: self.status_var.set(
+                            "⚠ Ошибка batch-коммита"))
+                else:
+                    self.after(0, lambda: self.status_var.set(
+                        "✅ Все файлы уже синхронизированы"))
+
                 self.after(1000, self._do_scan)
 
             except Exception as e:
-                self.after(0, lambda: self.status_var.set(f"⚠ Ошибка отправки: {e}"))
+                self.after(0, lambda: self.status_var.set(
+                    f"⚠ Ошибка отправки: {e}"))
 
         threading.Thread(target=upload_worker, daemon=True).start()
 
@@ -1550,13 +1689,9 @@ def main():
         import tkinter as _tk
     except ImportError:
         print("Ошибка: tkinter не установлен.")
-        print("Установите Python с поддержкой tkinter: https://www.python.org/downloads/")
-        input("Нажмите Enter для выхода...")
         sys.exit(1)
 
     app = MainApp()
-
-    # Иконка (пробуем загрузить, не критично)
     try:
         icon_path = os.path.join(APP_DIR, "icon.ico")
         if os.path.exists(icon_path):
