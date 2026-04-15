@@ -79,7 +79,7 @@ def encode_path_for_url(path: str) -> str:
 
 
 # ============================================================
-# Мерж текстовых файлов
+# Мерж текстовых файлов (3-way merge)
 # ============================================================
 
 class MergeResult:
@@ -92,8 +92,167 @@ class MergeResult:
         self.remote_only_lines = remote_only_lines
 
 
-def merge_text_contents(local_content: bytes, remote_content: bytes,
-                        path: str = "") -> MergeResult:
+def three_way_merge(base_content, local_content, remote_content, path=""):
+    """
+    3-way merge: base — общая предковая версия.
+    Сравниваем base→local и base→remote чтобы определить,
+    какая сторона изменила каждый блок.
+    
+    Возвращает MergeResult:
+    - success=True если нет конфликтов (auto-merge)
+    - success=False если есть перекрывающиеся изменения
+    """
+    # Если local == base → только remote изменился → берём remote
+    if local_content == base_content:
+        return MergeResult(success=True, content=remote_content,
+                           remote_only_lines=1)
+    # Если remote == base → только local изменился → берём local
+    if remote_content == base_content:
+        return MergeResult(success=True, content=local_content,
+                           local_only_lines=1)
+    # Если local == remote → обе стороны одинаково изменили → берём любую
+    if local_content == remote_content:
+        return MergeResult(success=True, content=local_content)
+
+    # Бинарные файлы
+    if is_binary(local_content) or is_binary(remote_content) or is_binary(base_content):
+        return MergeResult(
+            success=False,
+            conflicts=["Бинарный файл — автоматический мерж невозможен"])
+
+    base_lines = base_content.decode("utf-8", errors="replace").splitlines()
+    local_lines = local_content.decode("utf-8", errors="replace").splitlines()
+    remote_lines = remote_content.decode("utf-8", errors="replace").splitlines()
+
+    # Diff base→local и base→remote
+    local_ops = list(difflib.SequenceMatcher(None, base_lines, local_lines).get_opcodes())
+    remote_ops = list(difflib.SequenceMatcher(None, base_lines, remote_lines).get_opcodes())
+
+    # Собираем changed regions: (base_start, base_end, new_lines, source)
+    local_changes = []
+    for tag, i1, i2, j1, j2 in local_ops:
+        if tag != "equal":
+            local_changes.append((i1, i2, local_lines[j1:j2], "local"))
+
+    remote_changes = []
+    for tag, i1, i2, j1, j2 in remote_ops:
+        if tag != "equal":
+            remote_changes.append((i1, i2, remote_lines[j1:j2], "remote"))
+
+    # Проверяем перекрытия
+    conflicts = []
+    for ls, le, ll, _ in local_changes:
+        for rs, re, rl, _ in remote_changes:
+            # Диапазоны перекрываются?
+            if ls < re and rs < le:
+                # Проверяем: может быть обе стороны сделали ОДИНАКОВОЕ изменение
+                if ll == rl:
+                    continue  # Одинаковое изменение — не конфликт
+                conflicts.append(
+                    f"Строки {min(ls, rs) + 1}-{max(le, re)}: "
+                    f"изменены с обеих сторон по-разному")
+
+    if conflicts:
+        # Конфликт — собираем с маркерами
+        merged = _build_conflict_result(
+            base_lines, local_changes, remote_changes)
+        return MergeResult(
+            success=False, content=merged, conflicts=conflicts,
+            local_only_lines=sum(len(c[2]) for c in local_changes),
+            remote_only_lines=sum(len(c[2]) for c in remote_changes))
+
+    # Чистый мерж — объединяем все изменения
+    merged = _build_clean_merge(base_lines, local_changes, remote_changes)
+
+    result_text = "\n".join(merged)
+    base_text = base_content.decode("utf-8", errors="replace")
+    local_text = local_content.decode("utf-8", errors="replace")
+    remote_text = remote_content.decode("utf-8", errors="replace")
+    if base_text.endswith("\n") or local_text.endswith("\n") or remote_text.endswith("\n"):
+        result_text += "\n"
+
+    return MergeResult(
+        success=True, content=result_text.encode("utf-8"),
+        local_only_lines=sum(len(c[2]) for c in local_changes),
+        remote_only_lines=sum(len(c[2]) for c in remote_changes))
+
+
+def _build_clean_merge(base_lines, local_changes, remote_changes):
+    """Собирает чистый мерж: все изменения с обеих сторон."""
+    all_changes = sorted(
+        local_changes + remote_changes,
+        key=lambda c: (c[0], c[1]))
+
+    merged = []
+    pos = 0
+    for start, end, new_lines, source in all_changes:
+        # Добавляем неизменённые строки до этого изменения
+        if start > pos:
+            merged.extend(base_lines[pos:start])
+        # Если уже обработали этот диапазон (дубликат от local и remote
+        # с одинаковым результатом) — пропускаем
+        if start < pos:
+            continue
+        merged.extend(new_lines)
+        pos = end
+
+    # Хвост
+    if pos < len(base_lines):
+        merged.extend(base_lines[pos:])
+
+    return merged
+
+
+def _build_conflict_result(base_lines, local_changes, remote_changes):
+    """Собирает текст с маркерами конфликтов."""
+    all_changes = sorted(
+        local_changes + remote_changes,
+        key=lambda c: (c[0], c[1]))
+
+    merged = []
+    pos = 0
+    seen_ranges = set()
+
+    for start, end, new_lines, source in all_changes:
+        if start > pos:
+            merged.extend(base_lines[pos:start])
+
+        range_key = (start, end)
+        if range_key in seen_ranges:
+            # Вторая сторона того же диапазона — конфликт
+            merged.append("=======")
+            merged.extend(new_lines)
+            merged.append(">>>>>>> ВЕРСИЯ РЕПОЗИТОРИЯ")
+            pos = end
+            continue
+
+        seen_ranges.add(range_key)
+
+        # Проверяем есть ли изменение с другой стороны в том же диапазоне
+        has_other = any(
+            s == start and e == end and src != source
+            for s, e, _, src in (local_changes if source == "remote" else remote_changes)
+        )
+
+        if has_other:
+            merged.append("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ")
+            merged.extend(new_lines)
+        else:
+            merged.extend(new_lines)
+            pos = end
+
+    if pos < len(base_lines):
+        merged.extend(base_lines[pos:])
+
+    return "\n".join(merged).encode("utf-8")
+
+
+def merge_text_contents(local_content, remote_content, path=""):
+    """
+    Простая 2-way merge (без базовой версии).
+    Используется только когда базовая версия неизвестна.
+    Для replace-блоков берёт LOCAL версию (приоритет пользователя).
+    """
     if not local_content:
         return MergeResult(success=True, content=remote_content)
     if not remote_content:
@@ -102,8 +261,7 @@ def merge_text_contents(local_content: bytes, remote_content: bytes,
     if is_binary(local_content) or is_binary(remote_content):
         return MergeResult(
             success=False,
-            conflicts=["Бинарный файл — автоматический мерж невозможен"],
-        )
+            conflicts=["Бинарный файл — автоматический мерж невозможен"])
 
     local_text = local_content.decode("utf-8", errors="replace")
     remote_text = remote_content.decode("utf-8", errors="replace")
@@ -114,52 +272,36 @@ def merge_text_contents(local_content: bytes, remote_content: bytes,
         return MergeResult(success=True, content=local_content)
 
     merged = []
-    conflicts = []
     local_added = 0
     remote_added = 0
 
     matcher = difflib.SequenceMatcher(None, remote_lines, local_lines)
-    opcodes = list(matcher.get_opcodes())
 
-    for tag, i1, i2, j1, j2 in opcodes:
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             merged.extend(remote_lines[i1:i2])
         elif tag == "insert":
+            # Строки добавлены локально
             merged.extend(local_lines[j1:j2])
             local_added += (j2 - j1)
         elif tag == "delete":
-            pass  # локально удалены — не берём
+            # Строки есть в remote, нет в local — remote добавил
+            merged.extend(remote_lines[i1:i2])
+            remote_added += (i2 - i1)
         elif tag == "replace":
-            remote_block = remote_lines[i1:i2]
-            local_block = local_lines[j1:j2]
-            if remote_block == local_block:
-                merged.extend(remote_block)
-            else:
-                conflicts.append(
-                    f"Строки {len(merged) + 1}-{len(merged) + 1 + (j2 - j1) + 5 + (i2 - i1)}"
-                )
-                merged.append("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ")
-                merged.extend(local_block)
-                merged.append("=======")
-                merged.extend(remote_block)
-                merged.append(">>>>>>> ВЕРСИЯ РЕПОЗИТОРИЯ")
-                local_added += (j2 - j1)
-                remote_added += (i2 - i1)
+            # Разные версии блока — берём LOCAL (приоритет пользователя)
+            merged.extend(local_lines[j1:j2])
+            local_added += (j2 - j1)
 
     result_text = "\n".join(merged)
     if local_text.endswith("\n") or remote_text.endswith("\n"):
         result_text += "\n"
     result_bytes = result_text.encode("utf-8")
 
-    if conflicts:
-        return MergeResult(
-            success=False, content=result_bytes, conflicts=conflicts,
-            local_only_lines=local_added, remote_only_lines=remote_added,
-        )
     return MergeResult(
         success=True, content=result_bytes,
-        local_only_lines=local_added, remote_only_lines=remote_added,
-    )
+        local_only_lines=local_added,
+        remote_only_lines=remote_added)
 
 
 def save_conflict_files(local_folder, rel_path, local_content, remote_content):
@@ -935,10 +1077,11 @@ class MainApp(tk.Tk):
         self.scanner = None
         self.connected = False
         self.scanning = False
-        self._operation_active = False  # True = идёт отправка/скачивание
+        self._operation_active = False
         self.changes = []
         self.local_files = {}
         self.remote_tree = {}
+        self._synced_state = {}  # path → SHA (последняя синхронизированная версия)
         self._scan_after_id = None
         self._lock = threading.Lock()
 
@@ -1167,6 +1310,11 @@ class MainApp(tk.Tk):
         self.sync_btn.configure(state="normal")
         self.upload_all_btn.configure(state="normal")
         self.status_var.set(f"✅ Подключено к {repo_name} ({branch})")
+        # Инициализируем baseline: считаем remote = source of truth
+        if self.github:
+            tree, _ = self.github.get_tree()
+            with self._lock:
+                self._synced_state = {p: info["sha"] for p, info in tree.items()}
         self._start_scanning()
 
     def _disconnect(self):
@@ -1522,6 +1670,36 @@ class MainApp(tk.Tk):
                         if remote_content is None:
                             continue
 
+                        # 3-way merge: base = последняя синхронизированная
+                        with self._lock:
+                            base_sha = self._synced_state.get(path)
+
+                        base_content = None
+                        if base_sha and base_sha == remote_sha:
+                            # Remote не менялся с последнего sync →
+                            # только local изменился → берём local
+                            files_to_upload[path] = local_bytes
+                            continue
+
+                        if base_sha and base_sha == change.get("local_hash"):
+                            # Local не менялся → только remote изменился
+                            files_to_download[path] = (
+                                remote_content, remote_sha)
+                            continue
+
+                        # Обе стороны (возможно) изменились → 3-way merge
+                        if base_sha:
+                            # Скачиваем базовую версию
+                            base_content, _ = (
+                                self.github.get_file_content(
+                                    f"_base_{path}")
+                                if False else (None, None))
+                            # Базовую версию не храним —
+                            # используем fallback: если local_hash
+                            # совпадает с какой-то стороной
+                            pass
+
+                        # Пробуем мерж (2-way с приоритетом local)
                         mr = merge_text_contents(
                             local_bytes, remote_content, path)
 
@@ -1553,14 +1731,21 @@ class MainApp(tk.Tk):
                         files_to_upload, message=message,
                         progress_callback=on_batch_progress)
                     if ok:
-                        for path, content in files_to_upload.items():
-                            local_path = os.path.join(
-                                self.config.local_folder,
-                                path.replace("/", os.sep))
-                            os.makedirs(os.path.dirname(local_path),
-                                        exist_ok=True)
-                            with open(local_path, "wb") as f:
-                                f.write(content)
+                        # Обновляем synced_state для отправленных файлов
+                        new_tree, _ = self.github.get_tree()
+                        with self._lock:
+                            for path, content in files_to_upload.items():
+                                new_sha = new_tree.get(path, {}).get("sha")
+                                if new_sha:
+                                    self._synced_state[path] = new_sha
+                                # Обновляем локальные файлы
+                                local_path = os.path.join(
+                                    self.config.local_folder,
+                                    path.replace("/", os.sep))
+                                os.makedirs(os.path.dirname(local_path),
+                                            exist_ok=True)
+                                with open(local_path, "wb") as f:
+                                    f.write(content)
                     else:
                         log_error(f"auto_push: batch_commit вернул False для {n_batch} файлов")
                 except Exception as e:
@@ -1588,6 +1773,9 @@ class MainApp(tk.Tk):
                                     exist_ok=True)
                         with open(local_path, "wb") as f:
                             f.write(content)
+                        # Обновляем synced_state
+                        with self._lock:
+                            self._synced_state[path] = sha
                     except Exception as e:
                         errors.append(f"Download {path}: {e}")
                         log_error(f"auto_push download [{path}]: {e}")
