@@ -30,7 +30,7 @@ from dulwich import porcelain
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.9"
+APP_VERSION = "1.10"
 SCAN_INTERVAL_SEC = 5
 AUTO_CONNECT_RETRY_SEC = 10
 API_BASE = "https://api.github.com"
@@ -1262,6 +1262,7 @@ class MainApp(tk.Tk):
         self._setup_theme()
         self._create_ui()
         self._load_config_to_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._startup_auto_connect)
 
     def _setup_theme(self):
@@ -1701,6 +1702,8 @@ class MainApp(tk.Tk):
         self.sync_btn.configure(state="normal")
         self.upload_all_btn.configure(state="normal")
         self.status_var.set(f"✅ Подключено к {repo_name} ({branch})")
+        # Удаляем устаревшие transport-кэши от других репо/веток
+        self._cleanup_stale_transport()
         # Загружаем baseline из локального manifest; если его нет —
         # инициализируем текущим состоянием репозитория.
         if self.github:
@@ -1727,6 +1730,36 @@ class MainApp(tk.Tk):
         self.status_var.set("Отключено")
         self.tree.delete(*self.tree.get_children())
         self.changes = []
+
+    def _cleanup_stale_transport(self):
+        """Удаляет transport-кэши от других репозиториев/веток,
+        оставляя только текущий."""
+        try:
+            if not os.path.isdir(TRANSPORT_ROOT):
+                return
+            current_key = hashlib.sha1(
+                f"{self.config.repo_url}|{self.config.branch}".encode("utf-8")
+            ).hexdigest()[:16]
+            for entry in os.listdir(TRANSPORT_ROOT):
+                entry_path = os.path.join(TRANSPORT_ROOT, entry)
+                if os.path.isdir(entry_path) and entry != current_key:
+                    shutil.rmtree(entry_path, ignore_errors=True)
+        except Exception as e:
+            log_error(f"cleanup_stale_transport: {e}")
+
+    def _cleanup_transport(self):
+        """Удаляет transport-кэш (.gitmergemods_transport) если он существует."""
+        try:
+            if os.path.isdir(TRANSPORT_ROOT):
+                shutil.rmtree(TRANSPORT_ROOT, ignore_errors=True)
+        except Exception as e:
+            log_error(f"cleanup_transport: {e}")
+
+    def _on_close(self):
+        """Обработчик закрытия окна — останавливает потоки и чистит кэш."""
+        self._disconnect()
+        self._cleanup_transport()
+        self.destroy()
 
     # ---- Сканирование ----
 
