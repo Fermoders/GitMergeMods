@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote as url_quote
 from datetime import datetime
 import difflib
 import re
@@ -69,6 +70,12 @@ def normalize_path(path: str) -> str:
 
 def is_binary(data: bytes) -> bool:
     return b"\x00" in data[:8192]
+
+
+def encode_path_for_url(path: str) -> str:
+    """Кодирует путь для GitHub API URL (кириллица и спецсимволы)."""
+    parts = path.split("/")
+    return "/".join(url_quote(p, safe="") for p in parts)
 
 
 # ============================================================
@@ -307,9 +314,10 @@ class GitHubClient:
         return tree, commit_sha
 
     def get_file_content(self, path):
+        encoded_path = encode_path_for_url(path)
         data = self._api_request(
             "GET",
-            f"/repos/{self.owner}/{self.repo}/contents/{path}",
+            f"/repos/{self.owner}/{self.repo}/contents/{encoded_path}",
             params={"ref": self.branch},
         )
         if data and "content" in data:
@@ -460,9 +468,10 @@ class GitHubClient:
         }
         if existing_sha:
             payload["sha"] = existing_sha
+        encoded_path = encode_path_for_url(path)
         result = self._api_request(
             "PUT",
-            f"/repos/{self.owner}/{self.repo}/contents/{path}",
+            f"/repos/{self.owner}/{self.repo}/contents/{encoded_path}",
             data=payload,
         )
         self.invalidate_cache()
