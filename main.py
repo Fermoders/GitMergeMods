@@ -27,7 +27,7 @@ import re
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.3"
+APP_VERSION = "1.5"
 SCAN_INTERVAL_SEC = 5
 API_BASE = "https://api.github.com"
 
@@ -38,6 +38,7 @@ else:
 
 CONFIG_FILE = os.path.join(APP_DIR, "gitmergemods_config.json")
 LOG_FILE = os.path.join(APP_DIR, "gitmergemods_errors.log")
+STATE_FILE = os.path.join(APP_DIR, "gitmergemods_state.json")
 
 
 # ============================================================
@@ -477,6 +478,15 @@ class GitHubClient:
                 return raw, blob_sha
         return None, None
 
+    def get_blob_content(self, blob_sha):
+        """Получает содержимое blob по SHA."""
+        blob = self._api_request(
+            "GET", f"/repos/{self.owner}/{self.repo}/git/blobs/{blob_sha}"
+        )
+        if blob and "content" in blob:
+            return base64.b64decode(blob["content"].replace("\n", ""))
+        return None
+
     # ---- Batch-коммит через Git Data API ----
 
     def create_blob(self, content):
@@ -670,13 +680,15 @@ class FileScanner:
         return result
 
     @staticmethod
-    def compare(local_files, remote_tree):
+    def compare(local_files, remote_tree, synced_state=None):
+        synced_state = synced_state or {}
         all_paths = set(local_files.keys()) | set(remote_tree.keys())
         changes = []
 
         for path in sorted(all_paths):
             local = local_files.get(path)
             remote = remote_tree.get(path)
+            synced_sha = synced_state.get(path)
 
             if local and not remote:
                 changes.append({
@@ -691,11 +703,23 @@ class FileScanner:
                     "full_path": path,
                 })
             elif local["hash"] != remote["sha"]:
+                if synced_sha:
+                    if local["hash"] != synced_sha and remote["sha"] == synced_sha:
+                        status = "local_changed"
+                    elif local["hash"] == synced_sha and remote["sha"] != synced_sha:
+                        status = "remote_changed"
+                    elif local["hash"] != synced_sha and remote["sha"] != synced_sha:
+                        status = "both_changed"
+                    else:
+                        status = "different_unknown"
+                else:
+                    status = "different_unknown"
                 changes.append({
-                    "path": path, "status": "changed",
+                    "path": path, "status": status,
                     "local_hash": local["hash"],
                     "remote_sha": remote["sha"],
                     "full_path": local["full_path"],
+                    "synced_sha": synced_sha,
                 })
 
         return changes
@@ -875,7 +899,10 @@ class DiffWindow(tk.Toplevel):
         status_text = {
             "local_only": "📄 Только локально",
             "remote_only": "☁️ Только в репозитории",
-            "changed": "⚡ Изменён с обеих сторон",
+            "local_changed": "📝 Изменён локально",
+            "remote_changed": "☁️ Изменён в репозитории",
+            "both_changed": "⚠ Изменён локально и в репозитории",
+            "different_unknown": "⚡ Версии различаются",
         }.get(local_status, local_status)
 
         ttk.Label(
@@ -933,7 +960,7 @@ class DiffWindow(tk.Toplevel):
                                            wraplength=860)
         self.merge_info_label.pack(fill="x", padx=8, pady=(0, 2))
 
-        if local_status == "changed" and local_content and remote_content:
+        if local_status in ("local_changed", "remote_changed", "both_changed", "different_unknown") and local_content and remote_content:
             mr = merge_text_contents(local_content, remote_content, file_path)
             if mr.success:
                 self.merge_info_label.configure(
@@ -961,7 +988,7 @@ class DiffWindow(tk.Toplevel):
             command=lambda: self._apply("remote_to_local"),
         ).pack(side="left", padx=4)
 
-        if local_status == "changed":
+        if local_status in ("local_changed", "remote_changed", "both_changed", "different_unknown"):
             ttk.Button(
                 btn_frame, text="🔀 Слить обе версии",
                 command=lambda: self._apply("merge"),
@@ -1188,7 +1215,10 @@ class MainApp(tk.Tk):
 
         self.tree.tag_configure("local_only", background="#d4edda")
         self.tree.tag_configure("remote_only", background="#cce5ff")
-        self.tree.tag_configure("changed", background="#f8d7da")
+        self.tree.tag_configure("local_changed", background="#d4edda")
+        self.tree.tag_configure("remote_changed", background="#cce5ff")
+        self.tree.tag_configure("both_changed", background="#f8d7da")
+        self.tree.tag_configure("different_unknown", background="#fff3cd")
         self.tree.tag_configure("conflict", background="#ff4444",
                                  foreground="white")
 
@@ -1224,6 +1254,35 @@ class MainApp(tk.Tk):
     def _set_status(self, text):
         """Обновляет статус-бар (thread-safe через after)."""
         self.after(0, lambda: self.status_var.set(text))
+
+    def _get_state_key(self):
+        folder = normalize_path(os.path.abspath(self.config.local_folder or ""))
+        repo = self.config.repo_url or ""
+        branch = self.config.branch or "main"
+        return f"{repo}|{branch}|{folder}"
+
+    def _load_synced_state_from_disk(self):
+        try:
+            if not os.path.exists(STATE_FILE):
+                return {}
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get(self._get_state_key(), {})
+        except Exception as e:
+            log_error(f"load_synced_state: {e}")
+            return {}
+
+    def _save_synced_state_to_disk(self):
+        try:
+            data = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data[self._get_state_key()] = self._synced_state
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log_error(f"save_synced_state: {e}")
 
     # ---- Конфигурация UI ----
 
@@ -1310,11 +1369,17 @@ class MainApp(tk.Tk):
         self.sync_btn.configure(state="normal")
         self.upload_all_btn.configure(state="normal")
         self.status_var.set(f"✅ Подключено к {repo_name} ({branch})")
-        # Инициализируем baseline: считаем remote = source of truth
+        # Загружаем baseline из локального manifest; если его нет —
+        # инициализируем текущим состоянием репозитория.
         if self.github:
             tree, _ = self.github.get_tree()
+            loaded_state = self._load_synced_state_from_disk()
             with self._lock:
-                self._synced_state = {p: info["sha"] for p, info in tree.items()}
+                self._synced_state = loaded_state or {
+                    p: info["sha"] for p, info in tree.items()
+                }
+            if not loaded_state:
+                self._save_synced_state_to_disk()
         self._start_scanning()
 
     def _disconnect(self):
@@ -1355,7 +1420,9 @@ class MainApp(tk.Tk):
                                if self.scanner else {})
                 remote_tree, commit_sha = (
                     self.github.get_tree() if self.github else ({}, None))
-                changes = FileScanner.compare(local_files, remote_tree)
+                with self._lock:
+                    synced_state = dict(self._synced_state)
+                changes = FileScanner.compare(local_files, remote_tree, synced_state)
 
                 with self._lock:
                     self.local_files = local_files
@@ -1394,12 +1461,18 @@ class MainApp(tk.Tk):
         STATUS_TEXT = {
             "local_only": "Только локально",
             "remote_only": "Только в репо",
-            "changed": "Отличается",
+            "local_changed": "Изменён локально",
+            "remote_changed": "Изменён в репозитории",
+            "both_changed": "Изменён с обеих сторон",
+            "different_unknown": "Версии различаются",
         }
         DIR_TEXT = {
             "local_only": "локальн. → репо",
             "remote_only": "репо → локальн.",
-            "changed": "проверка мержа...",
+            "local_changed": "локальн. → репо",
+            "remote_changed": "репо → локальн.",
+            "both_changed": "нужен мерж / выбор",
+            "different_unknown": "источник не определён",
         }
 
         for c in changes:
@@ -1431,9 +1504,11 @@ class MainApp(tk.Tk):
         vals = self.tree.item(sel[0], "values")
         if not vals:
             return
-        self._show_diff(str(vals[0]))
+        tags = self.tree.item(sel[0], "tags")
+        status_tag = tags[0] if tags else "different_unknown"
+        self._show_diff(str(vals[0]), status_tag)
 
-    def _show_diff(self, file_path):
+    def _show_diff(self, file_path, file_status="different_unknown"):
         with self._lock:
             local_info = self.local_files.get(file_path)
             remote_info = self.remote_tree.get(file_path)
@@ -1486,15 +1561,9 @@ class MainApp(tk.Tk):
                     remote_content, remote_sha = (
                         self.github.get_file_content(file_path))
 
-                status = "changed"
-                if local_info and not remote_info:
-                    status = "local_only"
-                elif remote_info and not local_info:
-                    status = "remote_only"
-
                 self.after(0, lambda: self._open_diff_window(
                     file_path, local_content, remote_content,
-                    remote_sha, status))
+                    remote_sha, file_status))
             except Exception as e:
                 log_error(f"show_diff [{file_path}]: {e}")
                 self.after(0, lambda: messagebox.showerror(
@@ -1542,6 +1611,12 @@ class MainApp(tk.Tk):
                     if mr.success:
                         self.github.upload_file(
                             file_path, mr.content, existing_sha=fresh_sha)
+                        tree, _ = self.github.get_tree()
+                        with self._lock:
+                            new_sha = tree.get(file_path, {}).get("sha")
+                            if new_sha:
+                                self._synced_state[file_path] = new_sha
+                        self._save_synced_state_to_disk()
                         os.makedirs(os.path.dirname(local_path), exist_ok=True)
                         with open(local_path, "wb") as f:
                             f.write(mr.content)
@@ -1558,6 +1633,12 @@ class MainApp(tk.Tk):
                 else:
                     self.github.upload_file(
                         file_path, local_content, existing_sha=remote_sha)
+                    tree, _ = self.github.get_tree()
+                    with self._lock:
+                        new_sha = tree.get(file_path, {}).get("sha")
+                        if new_sha:
+                            self._synced_state[file_path] = new_sha
+                    self._save_synced_state_to_disk()
                     self.status_var.set(
                         f"✅ {file_path} отправлен в репозиторий")
 
@@ -1569,20 +1650,34 @@ class MainApp(tk.Tk):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 with open(local_path, "wb") as f:
                     f.write(remote_content)
+                with self._lock:
+                    if remote_sha:
+                        self._synced_state[file_path] = remote_sha
+                self._save_synced_state_to_disk()
                 self.status_var.set(f"✅ {file_path} загружен локально")
 
             elif direction == "merge":
                 if local_content is None or remote_content is None:
                     messagebox.showwarning("Внимание", "Нужны обе версии.")
                     return
-                mr = merge_text_contents(
-                    local_content, remote_content, file_path)
+                with self._lock:
+                    base_sha = self._synced_state.get(file_path)
+                base_content = self.github.get_blob_content(base_sha) if base_sha else None
+                mr = (three_way_merge(base_content, local_content, remote_content, file_path)
+                      if base_content is not None else
+                      merge_text_contents(local_content, remote_content, file_path))
                 if mr.success:
                     os.makedirs(os.path.dirname(local_path), exist_ok=True)
                     with open(local_path, "wb") as f:
                         f.write(mr.content)
                     self.github.upload_file(
                         file_path, mr.content, existing_sha=remote_sha)
+                    tree, _ = self.github.get_tree()
+                    with self._lock:
+                        new_sha = tree.get(file_path, {}).get("sha")
+                        if new_sha:
+                            self._synced_state[file_path] = new_sha
+                    self._save_synced_state_to_disk()
                     self.status_var.set(
                         f"✅ {file_path} — смержено "
                         f"(+{mr.local_only_lines} локально, "
@@ -1641,7 +1736,7 @@ class MainApp(tk.Tk):
                     self._set_status(
                         f"🔄 Анализ: {short} ({idx + 1}/{n_total})")
 
-                    if status == "local_only":
+                    if status in ("local_only", "local_changed"):
                         full_path = change.get("full_path") or os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -1649,14 +1744,14 @@ class MainApp(tk.Tk):
                             with open(full_path, "rb") as f:
                                 files_to_upload[path] = f.read()
 
-                    elif status == "remote_only":
+                    elif status in ("remote_only", "remote_changed"):
                         remote_content, remote_sha = (
                             self.github.get_file_content(path))
                         if remote_content:
                             files_to_download[path] = (
                                 remote_content, remote_sha)
 
-                    elif status == "changed":
+                    elif status in ("both_changed", "different_unknown"):
                         local_path = os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -1670,38 +1765,20 @@ class MainApp(tk.Tk):
                         if remote_content is None:
                             continue
 
-                        # 3-way merge: base = последняя синхронизированная
                         with self._lock:
                             base_sha = self._synced_state.get(path)
 
-                        base_content = None
-                        if base_sha and base_sha == remote_sha:
-                            # Remote не менялся с последнего sync →
-                            # только local изменился → берём local
-                            files_to_upload[path] = local_bytes
-                            continue
-
-                        if base_sha and base_sha == change.get("local_hash"):
-                            # Local не менялся → только remote изменился
-                            files_to_download[path] = (
-                                remote_content, remote_sha)
-                            continue
-
-                        # Обе стороны (возможно) изменились → 3-way merge
                         if base_sha:
-                            # Скачиваем базовую версию
-                            base_content, _ = (
-                                self.github.get_file_content(
-                                    f"_base_{path}")
-                                if False else (None, None))
-                            # Базовую версию не храним —
-                            # используем fallback: если local_hash
-                            # совпадает с какой-то стороной
-                            pass
-
-                        # Пробуем мерж (2-way с приоритетом local)
-                        mr = merge_text_contents(
-                            local_bytes, remote_content, path)
+                            base_content = self.github.get_blob_content(base_sha)
+                            if base_content is not None:
+                                mr = three_way_merge(
+                                    base_content, local_bytes, remote_content, path)
+                            else:
+                                mr = merge_text_contents(
+                                    local_bytes, remote_content, path)
+                        else:
+                            mr = merge_text_contents(
+                                local_bytes, remote_content, path)
 
                         if mr.success:
                             files_to_upload[path] = mr.content
@@ -1746,6 +1823,7 @@ class MainApp(tk.Tk):
                                             exist_ok=True)
                                 with open(local_path, "wb") as f:
                                     f.write(content)
+                        self._save_synced_state_to_disk()
                     else:
                         log_error(f"auto_push: batch_commit вернул False для {n_batch} файлов")
                 except Exception as e:
@@ -1776,6 +1854,7 @@ class MainApp(tk.Tk):
                         # Обновляем synced_state
                         with self._lock:
                             self._synced_state[path] = sha
+                        self._save_synced_state_to_disk()
                     except Exception as e:
                         errors.append(f"Download {path}: {e}")
                         log_error(f"auto_push download [{path}]: {e}")
@@ -1843,6 +1922,12 @@ class MainApp(tk.Tk):
                     {path: local_content},
                     message=f"Conflict resolved (local): {path} [{ts}]")
                 if ok:
+                    tree, _ = self.github.get_tree()
+                    with self._lock:
+                        new_sha = tree.get(path, {}).get("sha")
+                        if new_sha:
+                            self._synced_state[path] = new_sha
+                    self._save_synced_state_to_disk()
                     # Обновляем локальный файл (repo = source of truth)
                     os.makedirs(os.path.dirname(local_path), exist_ok=True)
                     with open(local_path, "wb") as f:
@@ -1858,6 +1943,10 @@ class MainApp(tk.Tk):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 with open(local_path, "wb") as f:
                     f.write(remote_content)
+                with self._lock:
+                    if remote_sha:
+                        self._synced_state[path] = remote_sha
+                self._save_synced_state_to_disk()
                 self.status_var.set(
                     f"✅ {path} — загружена версия из репозитория "
                     f"(ваши изменения потеряны)")
@@ -1866,6 +1955,10 @@ class MainApp(tk.Tk):
                 backup_path = save_conflict_files(
                     self.config.local_folder, path,
                     local_content, remote_content)
+                with self._lock:
+                    if remote_sha:
+                        self._synced_state[path] = remote_sha
+                self._save_synced_state_to_disk()
                 self.status_var.set(
                     f"💾 {path}: репо → основной, ваш → "
                     f"{os.path.basename(backup_path)}")
@@ -1932,6 +2025,9 @@ class MainApp(tk.Tk):
 
                 self._set_status(f"✅ Загружено {count} файлов")
                 self._update_progress(100, f"✅ {count} файл(ов)")
+                with self._lock:
+                    self._synced_state = {p: info["sha"] for p, info in remote_tree.items()}
+                self._save_synced_state_to_disk()
                 self.after(1000, self._do_scan)
 
             except Exception as e:
@@ -1994,6 +2090,10 @@ class MainApp(tk.Tk):
                     progress_callback=on_progress)
 
                 if ok:
+                    tree, _ = self.github.get_tree()
+                    with self._lock:
+                        self._synced_state = {p: info["sha"] for p, info in tree.items()}
+                    self._save_synced_state_to_disk()
                     self._set_status(
                         f"✅ Отправлено {n_files} файл(ов) — один коммит")
                     self._update_progress(100, f"✅ {n_files} файл(ов)")

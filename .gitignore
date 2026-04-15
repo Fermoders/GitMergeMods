@@ -4,4 +4,6 @@ build/
 dist/
 *.spec
 gitmergemods_config.json
+gitmergemods_state.json
+gitmergemods_errors.log
 *.exe
