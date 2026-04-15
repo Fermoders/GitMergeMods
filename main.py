@@ -1525,6 +1525,7 @@ class MainApp(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-3>", self._on_right_click)
 
         self.tree.tag_configure("local_only", background="#d4edda")
         self.tree.tag_configure("remote_only", background="#cce5ff")
@@ -2118,6 +2119,67 @@ class MainApp(tk.Tk):
         status_tag = tags[0] if tags else "different_unknown"
         self._show_diff(str(vals[0]), status_tag)
 
+    def _on_right_click(self, event):
+        """ПКМ — контекстное меню: показать различия."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        vals = self.tree.item(row, "values")
+        if not vals:
+            return
+        tags = self.tree.item(row, "tags")
+        status_tag = tags[0] if tags else "different_unknown"
+        file_path = str(vals[0])
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="📋 Показать различия",
+            command=lambda: self._show_diff(file_path, status_tag))
+        menu.add_separator()
+        short = os.path.basename(file_path)
+        menu.add_command(
+            label=f"📤 Отправить {short} в репозиторий",
+            command=lambda: self._quick_action(
+                file_path, status_tag, "local_to_remote"))
+        menu.add_command(
+            label=f"📥 Скачать {short} из репозитория",
+            command=lambda: self._quick_action(
+                file_path, status_tag, "remote_to_local"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _quick_action(self, file_path, status_tag, action):
+        """Быстрое действие из контекстного меню."""
+        with self._lock:
+            local_info = self.local_files.get(file_path)
+            remote_info = self.remote_tree.get(file_path)
+
+        local_content = None
+        if local_info:
+            try:
+                with open(local_info["full_path"], "rb") as f:
+                    local_content = f.read()
+            except Exception:
+                pass
+
+        if not local_info:
+            direct_path = os.path.join(
+                self.config.local_folder,
+                file_path.replace("/", os.sep))
+            if os.path.isfile(direct_path):
+                try:
+                    with open(direct_path, "rb") as f:
+                        local_content = f.read()
+                except Exception:
+                    pass
+
+        remote_sha = None
+        if remote_info:
+            remote_sha = remote_info.get("sha")
+
+        self._apply_single_change(
+            file_path, action, local_content, None, remote_sha)
+
     def _show_diff(self, file_path, file_status="different_unknown"):
         with self._lock:
             local_info = self.local_files.get(file_path)
@@ -2370,8 +2432,10 @@ class MainApp(tk.Tk):
             new_files = {}       # local_only → transport batch push
             changed_files = {}  # local_changed / merged → REST API batch_commit
             files_to_download = {}
-            conflict_list = []
+            confirm_queue = []  # файлы для подтверждения через DiffWindow
             errors = []
+
+            auto_merge = self.auto_merge_update_var.get()
 
             # === Фаза 1: анализ изменений ===
             for idx, change in enumerate(changes):
@@ -2387,6 +2451,7 @@ class MainApp(tk.Tk):
                         f"🔄 Анализ: {short} ({idx + 1}/{n_total})")
 
                     if status == "local_only":
+                        # Новые файлы — всегда отправлять без подтверждения
                         full_path = change.get("full_path") or os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -2395,24 +2460,29 @@ class MainApp(tk.Tk):
                                 new_files[path] = f.read()
 
                     elif status == "local_changed":
-                        full_path = change.get("full_path") or os.path.join(
-                            self.config.local_folder,
-                            path.replace("/", os.sep))
-                        if os.path.isfile(full_path):
-                            with open(full_path, "rb") as f:
-                                changed_files[path] = f.read()
+                        if auto_merge:
+                            full_path = change.get("full_path") or os.path.join(
+                                self.config.local_folder,
+                                path.replace("/", os.sep))
+                            if os.path.isfile(full_path):
+                                with open(full_path, "rb") as f:
+                                    changed_files[path] = f.read()
+                        else:
+                            # Требуется подтверждение
+                            confirm_queue.append(change)
 
                     elif status in ("remote_only", "remote_changed"):
-                        remote_content, remote_sha = (
-                            self.github.get_file_content(path))
-                        if remote_content:
-                            files_to_download[path] = (
-                                remote_content, remote_sha)
+                        if auto_merge:
+                            remote_content, remote_sha = (
+                                self.github.get_file_content(path))
+                            if remote_content:
+                                files_to_download[path] = (
+                                    remote_content, remote_sha)
+                        else:
+                            confirm_queue.append(change)
 
                     elif status in ("both_changed", "different_unknown"):
-                        if not self.auto_merge_update_var.get():
-                            continue
-
+                        # Получаем remote для confirm_queue
                         local_path = os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -2420,21 +2490,20 @@ class MainApp(tk.Tk):
                         if os.path.isfile(local_path):
                             with open(local_path, "rb") as f:
                                 local_bytes = f.read()
-
                         remote_content, remote_sha = (
                             self.github.get_file_content(path))
-                        if remote_content is None:
-                            continue
 
-                        mr = self._build_merge_result(
-                            path, status, local_bytes, remote_content)
-
-                        if mr and mr.success:
-                            changed_files[path] = mr.content
+                        if auto_merge:
+                            if remote_content is None:
+                                continue
+                            mr = self._build_merge_result(
+                                path, status, local_bytes, remote_content)
+                            if mr and mr.success:
+                                changed_files[path] = mr.content
+                            else:
+                                confirm_queue.append(change)
                         else:
-                            conflict_list.append((
-                                path, local_bytes,
-                                remote_content, remote_sha))
+                            confirm_queue.append(change)
 
                 except Exception as e:
                     errors.append(f"{path}: {e}")
@@ -2540,9 +2609,14 @@ class MainApp(tk.Tk):
                         errors.append(f"Download {path}: {e}")
                         log_error(f"auto_push download [{path}]: {e}")
 
-            # === Фаза 5: конфликты ===
-            if conflict_list:
-                self.after(0, lambda: self._show_conflicts(conflict_list))
+            # === Фаза 5: подтверждение пользователя (DiffWindow) ===
+            if confirm_queue:
+                self.after(0, lambda: self._show_confirm_queue(confirm_queue))
+            elif not new_files and not changed_files and not files_to_download:
+                self._set_status("✅ Изменений нет")
+                self._update_progress(100, "")
+                self._operation_active = False
+                self.after(5000, self._do_scan)
             else:
                 msg = "✅ Синхронизация завершена"
                 if n_new:
@@ -2564,6 +2638,70 @@ class MainApp(tk.Tk):
         """Показывает конфликты по одному, каждый — отдельный коммит."""
         self._conflict_queue = list(conflict_list)
         self._process_next_conflict()
+
+    def _show_confirm_queue(self, change_list):
+        """Показывает DiffWindow для каждого файла по очереди.
+        change_list — список dict с ключами path, status, (опционально full_path).
+        """
+        self._confirm_queue = list(change_list)
+        self._process_next_confirm()
+
+    def _process_next_confirm(self):
+        """Показывает DiffWindow для следующего файла в очереди подтверждения."""
+        if not self._confirm_queue:
+            self.status_var.set(
+                "✅ Все файлы обработаны. Сканирование...")
+            self._operation_active = False
+            self.after(2000, self._do_scan)
+            return
+
+        change = self._confirm_queue.pop(0)
+        path = change["path"]
+        status = change["status"]
+        self.status_var.set(f"Подтверждение: {os.path.basename(path)}")
+
+        # Загружаем remote в фоне, потом показываем DiffWindow
+        def fetch_and_confirm():
+            try:
+                local_content = None
+                local_path = os.path.join(
+                    self.config.local_folder,
+                    path.replace("/", os.sep))
+                if os.path.isfile(local_path):
+                    with open(local_path, "rb") as f:
+                        local_content = f.read()
+
+                remote_content = None
+                remote_sha = None
+                if status not in ("local_only", "local_changed"):
+                    remote_content, remote_sha = (
+                        self.github.get_file_content(path))
+
+                # Определяем статус для DiffWindow
+                diff_status = status
+                if status in ("both_changed", "different_unknown"):
+                    if local_content and remote_content:
+                        mr = self._build_merge_result(
+                            path, status, local_content, remote_content)
+                        if not mr or not mr.success:
+                            diff_status = "conflict"
+
+                def show():
+                    def on_apply(direction):
+                        self._apply_single_change(
+                            path, direction, local_content,
+                            remote_content, remote_sha)
+                        self.after(300, self._process_next_confirm)
+
+                    DiffWindow(self, path, local_content, remote_content,
+                               diff_status, on_apply)
+
+                self.after(0, show)
+            except Exception as e:
+                log_error(f"confirm_fetch [{path}]: {e}")
+                self.after(0, lambda: self._process_next_confirm())
+
+        threading.Thread(target=fetch_and_confirm, daemon=True).start()
 
     def _process_next_conflict(self):
         if not self._conflict_queue:
