@@ -20,6 +20,13 @@ if %errorlevel% neq 0 (
     pip install pyinstaller
 )
 
+REM Устанавливаем Dulwich если нет
+pip show dulwich >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Установка Dulwich...
+    pip install dulwich
+)
+
 echo.
 echo Сборка GitMergeMods.exe ...
 echo.

@@ -6,4 +6,5 @@ dist/
 gitmergemods_config.json
 gitmergemods_state.json
 gitmergemods_errors.log
+.gitmergemods_transport/
 *.exe

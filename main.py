@@ -9,9 +9,11 @@ Batch-коммиты, мерж по умолчанию, конфликт-диа�
 
 import os
 import sys
+import io
 import json
 import hashlib
 import base64
+import shutil
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -21,13 +23,14 @@ from urllib.parse import quote as url_quote
 from datetime import datetime
 import difflib
 import re
+from dulwich import porcelain
 
 # ============================================================
 # Константы
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 SCAN_INTERVAL_SEC = 5
 AUTO_CONNECT_RETRY_SEC = 10
 API_BASE = "https://api.github.com"
@@ -40,6 +43,7 @@ else:
 CONFIG_FILE = os.path.join(APP_DIR, "gitmergemods_config.json")
 LOG_FILE = os.path.join(APP_DIR, "gitmergemods_errors.log")
 STATE_FILE = os.path.join(APP_DIR, "gitmergemods_state.json")
+TRANSPORT_ROOT = os.path.join(APP_DIR, ".gitmergemods_transport")
 
 
 # ============================================================
@@ -1435,6 +1439,129 @@ class MainApp(tk.Tk):
         except Exception as e:
             log_error(f"save_synced_state: {e}")
 
+    def _get_transport_repo_path(self):
+        key = hashlib.sha1(
+            f"{self.config.repo_url}|{self.config.branch}".encode("utf-8")
+        ).hexdigest()[:16]
+        return os.path.join(TRANSPORT_ROOT, key)
+
+    def _build_auth_repo_url(self):
+        owner, repo = GitHubClient._parse_repo_url(self.config.repo_url)
+        token = url_quote(self.config.token, safe="")
+        return f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+
+    @staticmethod
+    def _dulwich_status_has_changes(status_obj):
+        staged = getattr(status_obj, "staged", {}) or {}
+        staged_changed = any(bool(v) for v in staged.values())
+        unstaged_changed = bool(getattr(status_obj, "unstaged", []))
+        untracked_changed = bool(getattr(status_obj, "untracked", []))
+        return staged_changed or unstaged_changed or untracked_changed
+
+    def _ensure_transport_repo(self, progress_callback=None):
+        def report(text, percent):
+            if progress_callback:
+                progress_callback(text, percent)
+
+        repo_path = self._get_transport_repo_path()
+        auth_url = self._build_auth_repo_url()
+        os.makedirs(TRANSPORT_ROOT, exist_ok=True)
+
+        def fresh_clone():
+            if os.path.exists(repo_path):
+                shutil.rmtree(repo_path, ignore_errors=True)
+            report("Клонирование transport-репозитория...", 3)
+            porcelain.clone(
+                auth_url,
+                target=repo_path,
+                checkout=True,
+                branch=self.config.branch,
+                outstream=io.BytesIO(),
+                errstream=io.BytesIO(),
+            )
+
+        git_dir = os.path.join(repo_path, ".git")
+        if not os.path.isdir(git_dir):
+            fresh_clone()
+            return repo_path
+
+        try:
+            status_obj = porcelain.status(repo_path)
+            if self._dulwich_status_has_changes(status_obj):
+                report("Очистка transport-репозитория...", 2)
+                fresh_clone()
+                return repo_path
+
+            report("Обновление transport-репозитория...", 5)
+            porcelain.pull(
+                repo_path,
+                remote_location=auth_url,
+                outstream=io.BytesIO(),
+                errstream=io.BytesIO(),
+                fast_forward=True,
+                force=True,
+            )
+            return repo_path
+        except Exception as e:
+            log_error(f"transport ensure: {e}")
+            fresh_clone()
+            return repo_path
+
+    def _transport_batch_push(self, files_to_upload, files_to_delete=None,
+                              message=None, progress_callback=None):
+        def report(text, percent):
+            if progress_callback:
+                progress_callback(text, percent)
+
+        files_to_delete = files_to_delete or {}
+        repo_path = self._ensure_transport_repo(progress_callback=progress_callback)
+        auth_url = self._build_auth_repo_url()
+        changed_paths = []
+        delete_paths = list(files_to_delete.keys())
+
+        total_upload = len(files_to_upload)
+        for idx, (path, content) in enumerate(files_to_upload.items()):
+            pct = 10 + int((idx / max(total_upload, 1)) * 35)
+            report(f"Подготовка: {os.path.basename(path)} ({idx + 1}/{total_upload})", pct)
+            abs_path = os.path.join(repo_path, path.replace("/", os.sep))
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "wb") as f:
+                f.write(content)
+            changed_paths.append(path)
+
+        if changed_paths:
+            report("Индексирование файлов...", 50)
+            porcelain.add(repo_path, paths=changed_paths)
+
+        if delete_paths:
+            report("Подготовка удалений...", 55)
+            porcelain.remove(repo_path, paths=delete_paths)
+
+        status_obj = porcelain.status(repo_path)
+        if not self._dulwich_status_has_changes(status_obj):
+            report("Изменений для push нет", 100)
+            return True, None
+
+        report("Создание локального коммита...", 70)
+        commit_id = porcelain.commit(repo_path, message=message)
+
+        report("Отправка pack в GitHub...", 85)
+        result = porcelain.push(
+            repo_path,
+            remote_location=auth_url,
+            refspecs=f"refs/heads/{self.config.branch}:refs/heads/{self.config.branch}",
+            outstream=io.BytesIO(),
+            errstream=io.BytesIO(),
+        )
+
+        ref_status = getattr(result, "ref_status", None) or {}
+        failures = {k: v for k, v in ref_status.items() if v}
+        if failures:
+            raise Exception(f"Push отклонен: {failures}")
+
+        report("Готово", 100)
+        return True, commit_id
+
     # ---- Конфигурация UI ----
 
     def _load_config_to_ui(self):
@@ -2075,7 +2202,7 @@ class MainApp(tk.Tk):
                     self._set_status(f"📤 {step_text} ({n_batch} файл(ов))")
 
                 try:
-                    ok, commit_sha = self.github.batch_commit(
+                    ok, commit_sha = self._transport_batch_push(
                         files_to_upload, message=message,
                         progress_callback=on_batch_progress)
                     if ok:
@@ -2096,10 +2223,10 @@ class MainApp(tk.Tk):
                                     f.write(content)
                         self._save_synced_state_to_disk()
                     else:
-                        log_error(f"auto_push: batch_commit вернул False для {n_batch} файлов")
+                        log_error(f"auto_push: transport push вернул False для {n_batch} файлов")
                 except Exception as e:
-                    errors.append(f"Batch commit: {e}")
-                    log_error(f"auto_push batch_commit: {e}")
+                    errors.append(f"Transport push: {e}")
+                    log_error(f"auto_push transport_push: {e}")
 
             # === Фаза 3: скачиваем remote_only ===
             n_dl = len(files_to_download)
@@ -2189,7 +2316,7 @@ class MainApp(tk.Tk):
 
                 # Пробуем batch из одного файла для отдельного коммита
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ok, _ = self.github.batch_commit(
+                ok, _ = self._transport_batch_push(
                     {path: local_content},
                     message=f"Conflict resolved (local): {path} [{ts}]")
                 if ok:
@@ -2355,7 +2482,7 @@ class MainApp(tk.Tk):
                         f"📤 {step_text}  ({n_files} файл(ов))")
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ok, _ = self.github.batch_commit(
+                ok, _ = self._transport_batch_push(
                     files_to_upload,
                     message=(f"Upload all: {n_files} файл(ов) [{ts}]"),
                     progress_callback=on_progress)
@@ -2369,9 +2496,9 @@ class MainApp(tk.Tk):
                         f"✅ Отправлено {n_files} файл(ов) — один коммит")
                     self._update_progress(100, f"✅ {n_files} файл(ов)")
                 else:
-                    self._set_status("⚠ Ошибка batch-коммита")
+                    self._set_status("⚠ Ошибка transport push")
                     self._update_progress(0, "Ошибка")
-                    log_error(f"upload_all: batch_commit вернул False для {n_files} файлов")
+                    log_error(f"upload_all: transport push вернул False для {n_files} файлов")
 
                 self.after(1000, self._do_scan)
 
