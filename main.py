@@ -326,18 +326,23 @@ class GitHubClient:
         raise Exception("Не удалось создать blob")
 
     def batch_commit(self, files_to_upload, files_to_delete_shas=None,
-                     message=None):
+                     message=None, progress_callback=None):
         """
         Создаёт один коммит с несколькими файлами через Git Data API.
 
         files_to_upload: dict {path: bytes_content}
-        files_to_delete_shas: dict {path: remote_sha} — файлы для удаления
-        message: текст коммита (если None — автогенерация)
+        files_to_delete_shas: dict {path: remote_sha}
+        message: текст коммита
+        progress_callback: callable(step_text, percent) или None
 
         Возвращает (success: bool, new_commit_sha: str | None)
         """
         if not files_to_upload and not files_to_delete_shas:
             return True, None
+
+        def report(step_text, percent):
+            if progress_callback:
+                progress_callback(step_text, percent)
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not message:
@@ -351,6 +356,7 @@ class GitHubClient:
             message = f"Auto-sync: {', '.join(parts)} [{ts}]"
 
         # 1. Текущий коммит и его дерево
+        report("Получение текущего состояния...", 5)
         current_sha = self.get_latest_commit_sha()
         if not current_sha:
             return False, None
@@ -362,9 +368,13 @@ class GitHubClient:
             return False, None
         base_tree_sha = commit_data["tree"]["sha"]
 
-        # 2. Создаём blobs для файлов
+        # 2. Создаём blobs для файлов (самая долгая часть)
         tree_entries = []
-        for path, content in files_to_upload.items():
+        total = len(files_to_upload)
+        for idx, (path, content) in enumerate(files_to_upload.items()):
+            pct = int(10 + (idx / max(total, 1)) * 65)
+            short_name = os.path.basename(path)
+            report(f"Отправка: {short_name} ({idx + 1}/{total})", pct)
             blob_sha = self.create_blob(content)
             tree_entries.append({
                 "path": path,
@@ -384,6 +394,7 @@ class GitHubClient:
                 })
 
         # 3. Создаём новое дерево
+        report("Создание дерева файлов...", 80)
         new_tree = self._api_request(
             "POST",
             f"/repos/{self.owner}/{self.repo}/git/trees",
@@ -394,6 +405,7 @@ class GitHubClient:
         new_tree_sha = new_tree["sha"]
 
         # 4. Создаём коммит
+        report("Создание коммита...", 90)
         new_commit = self._api_request(
             "POST",
             f"/repos/{self.owner}/{self.repo}/git/commits",
@@ -408,6 +420,7 @@ class GitHubClient:
         new_commit_sha = new_commit["sha"]
 
         # 5. Обновляем ссылку ветки
+        report("Применение коммита...", 95)
         result = self._api_request(
             "PATCH",
             f"/repos/{self.owner}/{self.repo}/git/refs/heads/{self.branch}",
@@ -417,6 +430,7 @@ class GitHubClient:
             return False, None
 
         self.invalidate_cache()
+        report("Готово", 100)
         return True, new_commit_sha
 
     def upload_file(self, path, content, existing_sha=None):
@@ -1009,12 +1023,38 @@ class MainApp(tk.Tk):
         self.tree.tag_configure("conflict", background="#ff4444",
                                  foreground="white")
 
+        # === Прогресс-бар ===
+        progress_frame = ttk.Frame(self)
+        progress_frame.pack(fill="x", padx=8, pady=(0, 2))
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, variable=self.progress_var,
+            maximum=100, mode="determinate")
+        self.progress_bar.pack(fill="x", side="left", expand=True)
+
+        self.progress_label = ttk.Label(progress_frame, text="", width=24,
+                                         anchor="e")
+        self.progress_label.pack(side="right", padx=(8, 0))
+
         # === Статус-бар ===
         self.status_var = tk.StringVar(
             value="Отключено. Укажите настройки и нажмите «Подключить».")
         ttk.Label(self, textvariable=self.status_var,
                    relief="sunken", anchor="w", padding=4).pack(
             fill="x", side="bottom", padx=8, pady=(0, 8))
+
+    # ---- Прогресс ----
+
+    def _update_progress(self, value, label=""):
+        """Обновляет прогресс-бар и метку (thread-safe через after)."""
+        self.after(0, lambda: self.progress_var.set(value))
+        if label:
+            self.after(0, lambda: self.progress_label.configure(text=label))
+
+    def _set_status(self, text):
+        """Обновляет статус-бар (thread-safe через after)."""
+        self.after(0, lambda: self.status_var.set(text))
 
     # ---- Конфигурация UI ----
 
@@ -1363,21 +1403,29 @@ class MainApp(tk.Tk):
         if not changes:
             return
 
-        self.status_var.set(
-            f"🔄 Авто-синхронизация: {len(changes)} изменений...")
+        n_total = len(changes)
+        self._update_progress(0, "Анализ...")
+        self._set_status(
+            f"🔄 Авто-синхронизация: {n_total} изменений...")
 
         def auto_worker():
-            files_to_upload = {}   # path → merged/content bytes
-            files_to_download = {} # path → (remote_content, remote_sha)
-            conflict_list = []     # (path, local_content, remote_content, sha)
+            files_to_upload = {}
+            files_to_download = {}
+            conflict_list = []
             errors = []
 
-            for change in changes:
+            # === Фаза 1: анализ изменений ===
+            for idx, change in enumerate(changes):
                 if not self.connected:
                     break
                 try:
                     path = change["path"]
                     status = change["status"]
+                    short = os.path.basename(path)
+                    pct = int((idx / max(n_total, 1)) * 40)
+                    self._update_progress(pct, f"Анализ: {short}")
+                    self._set_status(
+                        f"🔄 Анализ: {short} ({idx + 1}/{n_total})")
 
                     if status == "local_only":
                         full_path = change.get("full_path") or os.path.join(
@@ -1395,7 +1443,6 @@ class MainApp(tk.Tk):
                                 remote_content, remote_sha)
 
                     elif status == "changed":
-                        # Читаем локальный файл
                         local_path = os.path.join(
                             self.config.local_folder,
                             path.replace("/", os.sep))
@@ -1404,44 +1451,42 @@ class MainApp(tk.Tk):
                             with open(local_path, "rb") as f:
                                 local_bytes = f.read()
 
-                        # Скачиваем remote
                         remote_content, remote_sha = (
                             self.github.get_file_content(path))
                         if remote_content is None:
                             continue
 
-                        # Пробуем мерж
                         mr = merge_text_contents(
                             local_bytes, remote_content, path)
 
                         if mr.success:
-                            # Чистый мерж → в batch-коммит
                             files_to_upload[path] = mr.content
                         else:
-                            # Конфликт → отдаём пользователю
                             conflict_list.append((
-                                path, local_bytes, remote_content, remote_sha
-                            ))
+                                path, local_bytes,
+                                remote_content, remote_sha))
 
                 except Exception as e:
                     errors.append(f"{path}: {e}")
 
-            # === 1. Batch-коммит для неконфликтных файлов ===
-            batch_ok = False
+            # === Фаза 2: batch-коммит ===
+            n_batch = len(files_to_upload)
             if files_to_upload:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                n_files = len(files_to_upload)
-                message = (f"Auto-sync: {n_files} файл(ов) "
+                message = (f"Auto-sync: {n_batch} файл(ов) "
                            f"обновлено [{ts}]")
 
-                # Сначала пушим в репо единым коммитом
+                def on_batch_progress(step_text, percent):
+                    # Маппим 40-90% диапазон
+                    mapped = 40 + int(percent * 0.5)
+                    self._update_progress(mapped, step_text)
+                    self._set_status(f"📤 {step_text} ({n_batch} файл(ов))")
+
                 try:
                     ok, commit_sha = self.github.batch_commit(
-                        files_to_upload, message=message)
+                        files_to_upload, message=message,
+                        progress_callback=on_batch_progress)
                     if ok:
-                        batch_ok = True
-                        # Теперь заменяем локальные файлы на
-                        # версию из репо (repo = source of truth)
                         for path, content in files_to_upload.items():
                             local_path = os.path.join(
                                 self.config.local_folder,
@@ -1453,34 +1498,44 @@ class MainApp(tk.Tk):
                 except Exception as e:
                     errors.append(f"Batch commit: {e}")
 
-            # === 2. Скачиваем remote_only файлы ===
-            for path, (content, sha) in files_to_download.items():
-                try:
-                    local_path = os.path.join(
-                        self.config.local_folder,
-                        path.replace("/", os.sep))
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    with open(local_path, "wb") as f:
-                        f.write(content)
-                except Exception as e:
-                    errors.append(f"Download {path}: {e}")
+            # === Фаза 3: скачиваем remote_only ===
+            n_dl = len(files_to_download)
+            if files_to_download:
+                self._update_progress(92, f"Скачивание {n_dl} файл(ов)")
+                self._set_status(
+                    f"📥 Скачивание {n_dl} новых файлов...")
+                dl_idx = 0
+                for path, (content, sha) in files_to_download.items():
+                    dl_idx += 1
+                    short = os.path.basename(path)
+                    self._update_progress(92, f"{short}")
+                    self._set_status(
+                        f"📥 {short} ({dl_idx}/{n_dl})")
+                    try:
+                        local_path = os.path.join(
+                            self.config.local_folder,
+                            path.replace("/", os.sep))
+                        os.makedirs(os.path.dirname(local_path),
+                                    exist_ok=True)
+                        with open(local_path, "wb") as f:
+                            f.write(content)
+                    except Exception as e:
+                        errors.append(f"Download {path}: {e}")
 
-            # === 3. Конфликты → показываем пользователю ===
+            # === Фаза 4: конфликты ===
             n_conflicts = len(conflict_list)
             if conflict_list:
                 self.after(0, lambda: self._show_conflicts(conflict_list))
             else:
-                n_batch = len(files_to_upload)
-                n_dl = len(files_to_download)
                 msg = "✅ Синхронизация завершена"
                 if n_batch:
-                    msg += f" | Коммит: {n_batch} файл(ов)"
+                    msg += f" | Отправлено: {n_batch}"
                 if n_dl:
-                    msg += f" | Скачано: {n_dl} файл(ов)"
+                    msg += f" | Скачано: {n_dl}"
                 if errors:
                     msg += f" | Ошибок: {len(errors)}"
-                final_msg = msg
-                self.after(0, lambda: self.status_var.set(final_msg))
+                self._set_status(msg)
+                self._update_progress(100, "✅ Готово")
 
             if not conflict_list:
                 self.after(2000, self._do_scan)
@@ -1571,14 +1626,17 @@ class MainApp(tk.Tk):
         if not self.connected or not self.github:
             return
 
-        self.status_var.set("📥 Загрузка всех файлов из репозитория...")
-        self.update_idletasks()
+        self._update_progress(0, "Подготовка...")
+        self._set_status("📥 Загрузка всех файлов из репозитория...")
 
         def download_worker():
             try:
                 remote_tree, _ = self.github.get_tree()
+                total = len(remote_tree)
                 count = 0
+                processed = 0
                 for path, info in remote_tree.items():
+                    processed += 1
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
                         if ext not in self.config.extensions:
@@ -1597,6 +1655,12 @@ class MainApp(tk.Tk):
                                 need_download = True
 
                     if need_download:
+                        short = os.path.basename(path)
+                        pct = int((processed / max(total, 1)) * 100)
+                        self._update_progress(pct, f"{short}")
+                        self._set_status(
+                            f"📥 Скачивание: {short} "
+                            f"({processed}/{total})")
                         content, _ = self.github.get_file_content(path)
                         if content:
                             os.makedirs(os.path.dirname(local_path),
@@ -1605,13 +1669,13 @@ class MainApp(tk.Tk):
                                 f.write(content)
                             count += 1
 
-                self.after(0, lambda: self.status_var.set(
-                    f"✅ Загружено {count} файлов"))
+                self._set_status(f"✅ Загружено {count} файлов")
+                self._update_progress(100, f"✅ {count} файл(ов)")
                 self.after(1000, self._do_scan)
 
             except Exception as e:
-                self.after(0, lambda: self.status_var.set(
-                    f"⚠ Ошибка загрузки: {e}"))
+                self._set_status(f"⚠ Ошибка загрузки: {e}")
+                self._update_progress(0, "Ошибка")
 
         threading.Thread(target=download_worker, daemon=True).start()
 
@@ -1619,8 +1683,8 @@ class MainApp(tk.Tk):
         if not self.connected or not self.github:
             return
 
-        self.status_var.set("📤 Отправка всех файлов в репозиторий...")
-        self.update_idletasks()
+        self._update_progress(0, "Подготовка...")
+        self._set_status("📤 Отправка всех файлов в репозиторий...")
 
         def upload_worker():
             try:
@@ -1628,8 +1692,12 @@ class MainApp(tk.Tk):
                     local_files = dict(self.local_files)
                     remote_tree = dict(self.remote_tree)
 
+                # Собираем файлы для отправки
                 files_to_upload = {}
+                total_all = len(local_files)
+                idx = 0
                 for path, info in local_files.items():
+                    idx += 1
                     if self.filter_var.get():
                         ext = os.path.splitext(path)[1].lower()
                         if ext not in self.config.extensions:
@@ -1637,33 +1705,45 @@ class MainApp(tk.Tk):
 
                     remote_sha = remote_tree.get(path, {}).get("sha")
                     if remote_sha and info["hash"] == remote_sha:
-                        continue
+                        continue  # Уже синхронизирован
 
                     with open(info["full_path"], "rb") as f:
                         files_to_upload[path] = f.read()
 
-                if files_to_upload:
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ok, _ = self.github.batch_commit(
-                        files_to_upload,
-                        message=(f"Upload all: {len(files_to_upload)} "
-                                 f"файл(ов) [{ts}]"))
-                    if ok:
-                        self.after(0, lambda: self.status_var.set(
-                            f"✅ Отправлено {len(files_to_upload)} файлов "
-                            f"(один коммит)"))
-                    else:
-                        self.after(0, lambda: self.status_var.set(
-                            "⚠ Ошибка batch-коммита"))
+                if not files_to_upload:
+                    self._set_status("✅ Все файлы уже синхронизированы")
+                    self._update_progress(100, "")
+                    self.after(1000, self._do_scan)
+                    return
+
+                n_files = len(files_to_upload)
+                self._set_status(
+                    f"📤 Отправка {n_files} файл(ов) в репозиторий...")
+
+                def on_progress(step_text, percent):
+                    self._update_progress(percent, step_text)
+                    self._set_status(
+                        f"📤 {step_text}  ({n_files} файл(ов))")
+
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ok, _ = self.github.batch_commit(
+                    files_to_upload,
+                    message=(f"Upload all: {n_files} файл(ов) [{ts}]"),
+                    progress_callback=on_progress)
+
+                if ok:
+                    self._set_status(
+                        f"✅ Отправлено {n_files} файл(ов) — один коммит")
+                    self._update_progress(100, f"✅ {n_files} файл(ов)")
                 else:
-                    self.after(0, lambda: self.status_var.set(
-                        "✅ Все файлы уже синхронизированы"))
+                    self._set_status("⚠ Ошибка batch-коммита")
+                    self._update_progress(0, "Ошибка")
 
                 self.after(1000, self._do_scan)
 
             except Exception as e:
-                self.after(0, lambda: self.status_var.set(
-                    f"⚠ Ошибка отправки: {e}"))
+                self._set_status(f"⚠ Ошибка отправки: {e}")
+                self._update_progress(0, "Ошибка")
 
         threading.Thread(target=upload_worker, daemon=True).start()
 
