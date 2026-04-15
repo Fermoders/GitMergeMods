@@ -141,12 +141,36 @@ def compute_git_blob_hash(data: bytes) -> str:
     return hashlib.sha1(header + data).hexdigest()
 
 
+def compute_normalized_blob_hash(data: bytes) -> str:
+    """Hash после нормализации CRLF→LF для корректного сравнения с remote."""
+    return compute_git_blob_hash(normalize_to_lf(data))
+
+
 def normalize_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
 def is_binary(data: bytes) -> bool:
     return b"\x00" in data[:8192]
+
+
+def normalize_to_lf(data: bytes) -> bytes:
+    """Нормализует line endings: CRLF → LF для текстовых файлов.
+
+    Git хранит файлы с LF. Если отправить CRLF, весь файл будет показан
+    как изменённый в diff. Нормализуем перед отправкой.
+    """
+    if is_binary(data):
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("cp1251")
+        except Exception:
+            return data
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.encode("utf-8")
 
 
 def encode_path_for_url(path: str) -> str:
@@ -715,7 +739,7 @@ class GitHubClient:
             pct = int(10 + (idx / max(total, 1)) * 65)
             short_name = os.path.basename(path)
             report(f"Отправка: {short_name} ({idx + 1}/{total})", pct)
-            blob_sha = self.create_blob(content)
+            blob_sha = self.create_blob(normalize_to_lf(content))
             tree_entries.append({
                 "path": path,
                 "mode": "100644",
@@ -775,6 +799,7 @@ class GitHubClient:
 
     def upload_file(self, path, content, existing_sha=None):
         """Загрузка одного файла (для ручного разрешения конфликтов)."""
+        content = normalize_to_lf(content)
         content_b64 = base64.b64encode(content).decode("ascii")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload = {
@@ -833,7 +858,7 @@ class FileScanner:
                 try:
                     with open(full_path, "rb") as f:
                         content = f.read()
-                    blob_hash = compute_git_blob_hash(content)
+                    blob_hash = compute_normalized_blob_hash(content)
                     result[norm_path] = {
                         "hash": blob_hash,
                         "full_path": full_path,
@@ -1704,7 +1729,7 @@ class MainApp(tk.Tk):
             abs_path = os.path.join(repo_path, path.replace("/", os.sep))
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "wb") as f:
-                f.write(content)
+                f.write(normalize_to_lf(content))
             changed_paths.append(path)
 
         if changed_paths:
