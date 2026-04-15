@@ -66,6 +66,144 @@ def get_app_dir():
 
 
 # ============================================================
+# Мерж текстовых файлов
+# ============================================================
+
+class MergeResult:
+    """Результат попытки мержа двух версий файла."""
+
+    def __init__(self, success, content=None, conflicts=None,
+                 local_only_lines=0, remote_only_lines=0):
+        self.success = success           # True если чистый мерж
+        self.content = content           # bytes — результат мержа
+        self.conflicts = conflicts or []  # список строк с конфликтами
+        self.local_only_lines = local_only_lines
+        self.remote_only_lines = remote_only_lines
+
+
+def merge_text_contents(local_content: bytes, remote_content: bytes,
+                        path: str = "") -> MergeResult:
+    """
+    Пытается смержить локальную и удалённую версии текстового файла.
+
+    Стратегия:
+    1. Если одна сторона пуста — берём непустую (чистое добавление).
+    2. Если файлы бинарные — мерж невозможен, возвращаем конфликт.
+    3. Line-by-line merge через difflib.SequenceMatcher:
+       - Общие строки → берём как есть
+       - Строки только локально → добавляем (вставляем)
+       - Строки только в репо → добавляем (вставляем)
+       - Если изменения в одном и том же блоке — КОНФЛИКТ
+    """
+    # Одна сторона пуста
+    if not local_content:
+        return MergeResult(success=True, content=remote_content)
+    if not remote_content:
+        return MergeResult(success=True, content=local_content)
+
+    # Бинарные файлы
+    if is_binary(local_content) or is_binary(remote_content):
+        return MergeResult(
+            success=False,
+            conflicts=["Бинарный файл — автоматический мерж невозможен"],
+        )
+
+    local_text = local_content.decode("utf-8", errors="replace")
+    remote_text = remote_content.decode("utf-8", errors="replace")
+    local_lines = local_text.splitlines()
+    remote_lines = remote_text.splitlines()
+
+    # Если полностью совпадают — конфликтов нет
+    if local_lines == remote_lines:
+        return MergeResult(success=True, content=local_content)
+
+    # Line-by-line merge
+    merged = []
+    conflicts = []
+    local_added = 0
+    remote_added = 0
+
+    matcher = difflib.SequenceMatcher(None, remote_lines, local_lines)
+    opcodes = list(matcher.get_opcodes())
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            merged.extend(remote_lines[i1:i2])
+        elif tag == "insert":
+            # Строки добавлены только локально
+            merged.extend(local_lines[j1:j2])
+            local_added += (j2 - j1)
+        elif tag == "delete":
+            # Строки удалены из репо (были в remote, нет в local)
+            # Трактуем как: локально их удалили — не берём
+            remote_added += 0  # удаление не считается добавлением
+        elif tag == "replace":
+            # Обе стороны изменили один блок → КОНФЛИКТ
+            remote_block = remote_lines[i1:i2]
+            local_block = local_lines[j1:j2]
+
+            # Пытаемся разрешить: если блоки совпадают — не конфликт
+            if remote_block == local_block:
+                merged.extend(remote_block)
+            else:
+                # Реальный конфликт — включаем обе версии с маркерами
+                conflicts.append(
+                    f"Строки {len(merged) + 1}-{len(merged) + 1 + (j2-j1) + 5 + (i2-i1)}"
+                )
+                merged.append("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ")
+                merged.extend(local_block)
+                merged.append("=======")
+                merged.extend(remote_block)
+                merged.append(">>>>>>> ВЕРСИЯ РЕПОЗИТОРИЯ")
+                local_added += (j2 - j1)
+                remote_added += (i2 - i1)
+
+    result_text = "\n".join(merged)
+    if local_text.endswith("\n") or remote_text.endswith("\n"):
+        result_text += "\n"
+    result_bytes = result_text.encode("utf-8")
+
+    if conflicts:
+        return MergeResult(
+            success=False,
+            content=result_bytes,
+            conflicts=conflicts,
+            local_only_lines=local_added,
+            remote_only_lines=remote_added,
+        )
+    else:
+        return MergeResult(
+            success=True,
+            content=result_bytes,
+            local_only_lines=local_added,
+            remote_only_lines=remote_added,
+        )
+
+
+def save_conflict_files(local_folder: str, rel_path: str,
+                         local_content: bytes, remote_content: bytes):
+    """
+    При неразрешимом конфликте сохраняет обе версии:
+      file.xml       — remote версия (актуальная из репо)
+      file.xml.local — локальная версия
+    """
+    local_path = os.path.join(local_folder, rel_path.replace("/", os.sep))
+    backup_path = local_path + ".local"
+
+    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+
+    # Сохраняем локальную версию в .local
+    with open(backup_path, "wb") as f:
+        f.write(local_content)
+
+    # Сохраняем remote версию как основную
+    with open(local_path, "wb") as f:
+        f.write(remote_content)
+
+    return backup_path
+
+
+# ============================================================
 # Конфигурация (сохраняется рядом с .exe)
 # ============================================================
 
@@ -508,19 +646,56 @@ class DiffWindow(tk.Toplevel):
         self.local_text.configure(state="disabled")
         self.remote_text.configure(state="disabled")
 
+        # === Информация о мерже (для "changed") ===
+        self.merge_info_frame = ttk.Frame(self)
+        self.merge_info_frame.pack(fill="x", padx=8, pady=(0, 2))
+        self.merge_info_label = ttk.Label(self.merge_info_frame, text="",
+                                           foreground="#b06000", wraplength=860)
+        if local_status == "changed" and local_content and remote_content:
+            mr = merge_text_contents(local_content, remote_content, file_path)
+            if mr.success:
+                self.merge_info_label.configure(
+                    text=f"✅ Мерж возможен: {mr.local_only_lines} строк локально, "
+                         f"{mr.remote_only_lines} строк из репо — без конфликтов",
+                    foreground="#006600",
+                )
+            else:
+                conflict_text = "; ".join(mr.conflicts) if mr.conflicts else "обнаружены"
+                self.merge_info_label.configure(
+                    text=f"⚠ Конфликт: {conflict_text}. "
+                         f"Можно сохранить обе версии (.local) или выбрать одну сторону.",
+                    foreground="#cc0000",
+                )
+            self.merge_info_label.pack(anchor="w")
+            self._merge_result = mr
+        else:
+            self._merge_result = None
+
         # === Кнопки ===
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", padx=8, pady=8)
 
         ttk.Button(
-            btn_frame, text="← Применить локальную версию в Репо",
+            btn_frame, text="← Отправить локальную в Репо",
             command=lambda: self._apply("local_to_remote"),
         ).pack(side="left", padx=4)
 
         ttk.Button(
-            btn_frame, text="Скачать версию Репо → Локально",
+            btn_frame, text="Скачать из Репо → Локально",
             command=lambda: self._apply("remote_to_local"),
         ).pack(side="left", padx=4)
+
+        # Кнопка мержа (только при "changed")
+        if local_status == "changed":
+            ttk.Button(
+                btn_frame, text="🔀 Слить обе версии",
+                command=lambda: self._apply("merge"),
+            ).pack(side="left", padx=4)
+
+            ttk.Button(
+                btn_frame, text="💾 Сохранить обе (.local)",
+                command=lambda: self._apply("save_both"),
+            ).pack(side="left", padx=4)
 
         ttk.Button(
             btn_frame, text="Закрыть", command=self.destroy,
@@ -1048,7 +1223,7 @@ class MainApp(tk.Tk):
 
     def _apply_single_change(self, file_path, direction, local_content,
                               remote_content, local_hash, remote_sha):
-        """Применяет одно изменение."""
+        """Применяет одно изменение с поддержкой мержа."""
         try:
             if direction == "local_to_remote":
                 if local_content is None:
@@ -1056,9 +1231,39 @@ class MainApp(tk.Tk):
                     return
                 self.status_var.set(f"Отправка {file_path} → репозиторий...")
                 self.update_idletasks()
-                self.github.upload_file(file_path, local_content,
-                                         existing_sha=remote_sha)
-                self.status_var.set(f"✅ {file_path} отправлен в репозиторий")
+                # Сначала скачиваем актуальную remote версию
+                fresh_remote, fresh_sha = self.github.get_file_content(file_path)
+                if fresh_remote and fresh_sha and fresh_sha != remote_sha:
+                    # Remote изменился с момента открытия diff — пробуем мерж
+                    mr = merge_text_contents(local_content, fresh_remote, file_path)
+                    if mr.success:
+                        self.github.upload_file(file_path, mr.content,
+                                                 existing_sha=fresh_sha)
+                        # Сохраняем мерж локально тоже
+                        local_path = os.path.join(
+                            self.config.local_folder,
+                            file_path.replace("/", os.sep),
+                        )
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        with open(local_path, "wb") as f:
+                            f.write(mr.content)
+                        self.status_var.set(
+                            f"✅ {file_path} — смержено и отправлено (remote успел обновиться)"
+                        )
+                    else:
+                        messagebox.showwarning(
+                            "Конфликт при отправке",
+                            f"Файл {file_path} был изменён в репозитории "
+                            f"пока вы просматривали diff.\n\n"
+                            f"Автоматический мерж невозможен: {'; '.join(mr.conflicts)}\n\n"
+                            f"Закройте это окно и откройте diff заново.",
+                        )
+                        self.status_var.set(f"⚠ Конфликт: {file_path}")
+                        return
+                else:
+                    self.github.upload_file(file_path, local_content,
+                                             existing_sha=remote_sha)
+                    self.status_var.set(f"✅ {file_path} отправлен в репозиторий")
 
             elif direction == "remote_to_local":
                 if remote_content is None:
@@ -1073,6 +1278,68 @@ class MainApp(tk.Tk):
                 with open(local_path, "wb") as f:
                     f.write(remote_content)
                 self.status_var.set(f"✅ {file_path} загружен локально")
+
+            elif direction == "merge":
+                # Сливаем обе версии
+                if local_content is None or remote_content is None:
+                    messagebox.showwarning(
+                        "Внимание",
+                        "Для мержа нужны обе версии файла (локальная и удалённая).",
+                    )
+                    return
+                mr = merge_text_contents(local_content, remote_content, file_path)
+                if mr.success:
+                    # Чистый мерж — записываем локально и отправляем в репо
+                    local_path = os.path.join(
+                        self.config.local_folder,
+                        file_path.replace("/", os.sep),
+                    )
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "wb") as f:
+                        f.write(mr.content)
+                    self.github.upload_file(file_path, mr.content,
+                                             existing_sha=remote_sha)
+                    self.status_var.set(
+                        f"✅ {file_path} — смержено "
+                        f"(+{mr.local_only_lines} локально, "
+                        f"+{mr.remote_only_lines} из репо)"
+                    )
+                else:
+                    # Конфликт — предлагаем сохранить с маркерами
+                    result = messagebox.askyesno(
+                        "Конфликт мержа",
+                        f"Автоматический мерж невозможен для {file_path}:\n"
+                        f"{'; '.join(mr.conflicts)}\n\n"
+                        f"Сохранить файл с маркерами конфликта "
+                        f"(<<<<<<< / >>>>>>>) локально?\n"
+                        f"Также будет создана копия .local с вашей версией.",
+                    )
+                    if result:
+                        local_path = os.path.join(
+                            self.config.local_folder,
+                            file_path.replace("/", os.sep),
+                        )
+                        backup_path = save_conflict_files(
+                            self.config.local_folder, file_path,
+                            local_content, mr.content,
+                        )
+                        self.status_var.set(
+                            f"⚠ {file_path} — конфликт сохранён в {backup_path}"
+                        )
+                    return
+
+            elif direction == "save_both":
+                # Сохраняем обе версии: remote как основной, local как .local
+                if local_content is None or remote_content is None:
+                    messagebox.showwarning("Внимание", "Нужны обе версии файла.")
+                    return
+                backup_path = save_conflict_files(
+                    self.config.local_folder, file_path,
+                    local_content, remote_content,
+                )
+                self.status_var.set(
+                    f"💾 {file_path}: remote → основная, local → {os.path.basename(backup_path)}"
+                )
 
             self.after(1000, self._do_scan)
 
@@ -1119,15 +1386,45 @@ class MainApp(tk.Tk):
                             with open(local_path, "wb") as f:
                                 f.write(remote_content)
                     elif status == "changed":
-                        # Конфликт — приоритет репозитория (безопасно для многопользовательской работы)
-                        remote_content, _ = self.github.get_file_content(path)
-                        if remote_content:
-                            local_path = os.path.join(
-                                self.config.local_folder, path.replace("/", os.sep)
-                            )
+                        # Конфликт — пытаемся смержить
+                        full_path = change.get("full_path") or os.path.join(
+                            self.config.local_folder, path.replace("/", os.sep)
+                        )
+                        local_path = os.path.join(
+                            self.config.local_folder, path.replace("/", os.sep)
+                        )
+
+                        if os.path.isfile(local_path):
+                            with open(local_path, "rb") as f:
+                                local_bytes = f.read()
+                        else:
+                            local_bytes = b""
+
+                        remote_content, remote_sha = self.github.get_file_content(path)
+                        if remote_content is None:
+                            continue
+
+                        mr = merge_text_contents(local_bytes, remote_content, path)
+
+                        if mr.success:
+                            # Чистый мерж — записываем обе стороны
                             os.makedirs(os.path.dirname(local_path), exist_ok=True)
                             with open(local_path, "wb") as f:
-                                f.write(remote_content)
+                                f.write(mr.content)
+                            self.github.upload_file(
+                                path, mr.content, existing_sha=remote_sha
+                            )
+                        else:
+                            # Конфликт — remote локально + .local копия
+                            save_conflict_files(
+                                self.config.local_folder, path,
+                                local_bytes, remote_content,
+                            )
+                            print(
+                                f"Auto-push CONFLICT [{path}]: "
+                                f"{'; '.join(mr.conflicts)} — "
+                                f"сохранены обе версии (.local)"
+                            )
 
                 except Exception as e:
                     print(f"Auto-push error [{path}]: {e}")
