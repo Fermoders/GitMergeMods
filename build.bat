@@ -60,6 +60,15 @@ python -m PyInstaller ^
     --clean ^
     --noconfirm ^
     --collect-data certifi ^
+    --hidden-import truststore ^
+    --hidden-import dulwich ^
+    --hidden-import dulwich.porcelain ^
+    --hidden-import dulwich.client ^
+    --hidden-import dulwich.protocol ^
+    --hidden-import dulwich.pack ^
+    --hidden-import dulwich.repo ^
+    --hidden-import dulwich.object_store ^
+    --hidden-import urllib3 ^
     main.py
 
 if %errorlevel% equ 0 (

@@ -41,7 +41,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.11"
+APP_VERSION = "1.12"
 SCAN_INTERVAL_SEC = 5
 AUTO_CONNECT_RETRY_SEC = 10
 API_BASE = "https://api.github.com"
@@ -153,6 +153,49 @@ def encode_path_for_url(path: str) -> str:
     """Кодирует путь для GitHub API URL (кириллица и спецсимволы)."""
     parts = path.split("/")
     return "/".join(url_quote(p, safe="") for p in parts)
+
+
+def _force_rmtree(path):
+    """Удаляет дерево каталогов, обрабатывая read-only файлы (.git/objects).
+
+    На Windows dulwich создаёт read-only файлы в .git/objects/pack/,
+    из-за чего shutil.rmtree() молча не может их удалить (ignore_errors=True)
+    и следующий clone падает с WinError 183.
+    """
+    import stat
+
+    def on_error(func, filepath, exc_info):
+        try:
+            os.chmod(filepath, stat.S_IWRITE)
+            func(filepath)
+        except Exception:
+            pass
+
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, onerror=on_error)
+    except Exception:
+        # Последняя попытка — через 2 прохода
+        try:
+            for root, dirs, files in os.walk(path, topdown=False):
+                for f in files:
+                    try:
+                        fp = os.path.join(root, f)
+                        os.chmod(fp, stat.S_IWRITE)
+                        os.remove(fp)
+                    except Exception:
+                        pass
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, d))
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(path)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1552,7 +1595,7 @@ class MainApp(tk.Tk):
 
         def fresh_clone():
             if os.path.exists(repo_path):
-                shutil.rmtree(repo_path, ignore_errors=True)
+                _force_rmtree(repo_path)
             report("Клонирование transport-репозитория (shallow)...", 3)
             pool = get_urllib3_pool_manager()
             clone_kwargs = dict(
@@ -1850,7 +1893,7 @@ class MainApp(tk.Tk):
             for entry in os.listdir(TRANSPORT_ROOT):
                 entry_path = os.path.join(TRANSPORT_ROOT, entry)
                 if os.path.isdir(entry_path) and entry != current_key:
-                    shutil.rmtree(entry_path, ignore_errors=True)
+                    _force_rmtree(entry_path)
         except Exception as e:
             log_error(f"cleanup_stale_transport: {e}")
 
@@ -1858,7 +1901,7 @@ class MainApp(tk.Tk):
         """Удаляет transport-кэш (.gitmergemods_transport) если он существует."""
         try:
             if os.path.isdir(TRANSPORT_ROOT):
-                shutil.rmtree(TRANSPORT_ROOT, ignore_errors=True)
+                _force_rmtree(TRANSPORT_ROOT)
         except Exception as e:
             log_error(f"cleanup_transport: {e}")
 
