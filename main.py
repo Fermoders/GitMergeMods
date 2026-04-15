@@ -27,8 +27,9 @@ import re
 # ============================================================
 
 APP_NAME = "GitMergeMods"
-APP_VERSION = "1.5"
+APP_VERSION = "1.8"
 SCAN_INTERVAL_SEC = 5
+AUTO_CONNECT_RETRY_SEC = 10
 API_BASE = "https://api.github.com"
 
 if getattr(sys, "frozen", False):
@@ -1249,11 +1250,15 @@ class MainApp(tk.Tk):
         self.remote_tree = {}
         self._synced_state = {}  # path → SHA (последняя синхронизированная версия)
         self._scan_after_id = None
+        self._connect_retry_after_id = None
+        self._connect_in_progress = False
+        self._auto_connect_enabled = True
         self._lock = threading.Lock()
 
         self._setup_theme()
         self._create_ui()
         self._load_config_to_ui()
+        self.after(200, self._startup_auto_connect)
 
     def _setup_theme(self):
         style = ttk.Style(self)
@@ -1456,15 +1461,51 @@ class MainApp(tk.Tk):
         if folder:
             self.folder_var.set(folder)
 
+    def _has_connection_data(self):
+        token = self.token_var.get().strip()
+        repo_url = self.repo_var.get().strip()
+        folder = self.folder_var.get().strip()
+        return bool(token and repo_url and folder)
+
+    def _cancel_connect_retry(self):
+        if self._connect_retry_after_id:
+            self.after_cancel(self._connect_retry_after_id)
+            self._connect_retry_after_id = None
+
+    def _schedule_connect_retry(self):
+        self._cancel_connect_retry()
+        if not self._auto_connect_enabled or self.connected or self._connect_in_progress:
+            return
+        if not self._has_connection_data():
+            return
+        self._set_status(
+            f"⚠ Подключение не удалось. Повтор через {AUTO_CONNECT_RETRY_SEC} сек..."
+        )
+        self._connect_retry_after_id = self.after(
+            AUTO_CONNECT_RETRY_SEC * 1000,
+            self._startup_auto_connect,
+        )
+
+    def _startup_auto_connect(self):
+        if not self._auto_connect_enabled or self.connected or self._connect_in_progress:
+            return
+        if not self._has_connection_data():
+            return
+        self._connect(show_errors=False, schedule_retry=True)
+
     # ---- Подключение ----
 
     def _toggle_connection(self):
         if self.connected:
             self._disconnect()
         else:
-            self._connect()
+            self._auto_connect_enabled = True
+            self._connect(show_errors=True, schedule_retry=False)
 
-    def _connect(self):
+    def _connect(self, show_errors=True, schedule_retry=False):
+        if self.connected or self._connect_in_progress:
+            return
+
         self._save_config_from_ui()
         token = self.config.token
         repo_url = self.config.repo_url
@@ -1472,15 +1513,20 @@ class MainApp(tk.Tk):
         branch = self.config.branch
 
         if not token:
-            messagebox.showerror("Ошибка", "Укажите токен GitHub.")
+            if show_errors:
+                messagebox.showerror("Ошибка", "Укажите токен GitHub.")
             return
         if not repo_url:
-            messagebox.showerror("Ошибка", "Укажите URL репозитория.")
+            if show_errors:
+                messagebox.showerror("Ошибка", "Укажите URL репозитория.")
             return
         if not folder:
-            messagebox.showerror("Ошибка", "Укажите локальную папку.")
+            if show_errors:
+                messagebox.showerror("Ошибка", "Укажите локальную папку.")
             return
 
+        self._cancel_connect_retry()
+        self._connect_in_progress = True
         self.status_var.set("Подключение...")
         self.update_idletasks()
 
@@ -1489,10 +1535,14 @@ class MainApp(tk.Tk):
                 client = GitHubClient(token, repo_url, branch)
                 repo_info = client.test_connection()
                 if not repo_info:
-                    self.after(0, lambda: messagebox.showerror(
-                        "Ошибка", "Не удалось подключиться."))
+                    if show_errors:
+                        self.after(0, lambda: messagebox.showerror(
+                            "Ошибка", "Не удалось подключиться."))
                     self.after(0, lambda: self.status_var.set(
                         "Ошибка подключения"))
+                    log_error("connect: test_connection вернул пустой результат")
+                    if schedule_retry:
+                        self.after(0, self._schedule_connect_retry)
                     return
 
                 self.github = client
@@ -1504,11 +1554,18 @@ class MainApp(tk.Tk):
                 self.scanner = FileScanner(folder, exts)
                 self.connected = True
                 repo_name = repo_info.get("full_name", "?")
+                self.after(0, self._cancel_connect_retry)
                 self.after(0, lambda: self._on_connected(repo_name, branch))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(
-                    "Ошибка подключения", str(e)))
+                log_error(f"connect: {e}")
+                if show_errors:
+                    self.after(0, lambda: messagebox.showerror(
+                        "Ошибка подключения", str(e)))
                 self.after(0, lambda: self.status_var.set(f"Ошибка: {e}"))
+                if schedule_retry:
+                    self.after(0, self._schedule_connect_retry)
+            finally:
+                self._connect_in_progress = False
 
         threading.Thread(target=connect_worker, daemon=True).start()
 
@@ -1531,6 +1588,8 @@ class MainApp(tk.Tk):
         self._start_scanning()
 
     def _disconnect(self):
+        self._auto_connect_enabled = False
+        self._cancel_connect_retry()
         self.connected = False
         if self._scan_after_id:
             self.after_cancel(self._scan_after_id)
